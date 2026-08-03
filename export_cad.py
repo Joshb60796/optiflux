@@ -615,43 +615,53 @@ def build_lens_specs_from_params(params: Dict[str, Any], dies: Optional[list] = 
     """
     Build lens specs for export. MLA uses shared geometry helper so CAD matches
     the ray-tracer (Element 1 form scaled to die pitch).
+
+    Non-MLA stacks return one ``LensSpec`` per enabled element, with ``z_front``
+    advanced along the optical axis (same layout as the ray tracer).
     """
     elements = [e for e in params.get("elements", []) if e.get("enabled", True)]
     if not elements:
         return [], "empty"
-    e0 = elements[0]
     z0 = float(params.get("lens_z_start", 3.0))
     mla = params.get("mla", {}) or {}
     mla_on = bool(mla.get("enabled", False))
 
-    if not mla_on:
-        r1y = e0.get("R1y", None)
-        r2y = e0.get("R2y", None)
-        apy = e0.get("aperture_y", None)
-        return [
+    if mla_on:
+        from mla_geometry import build_mla_lens_specs
+
+        specs, _meta = build_mla_lens_specs(params, dies=dies)
+        return specs, "mla"
+
+    specs: List[LensSpec] = []
+    z = z0
+    for e in elements:
+        r1y = e.get("R1y", None)
+        r2y = e.get("R2y", None)
+        apy = e.get("aperture_y", None)
+        thick = float(e["thickness"])
+        specs.append(
             LensSpec(
-                R1=float(e0["R1"]),
-                R2=float(e0["R2"]),
-                thickness=float(e0["thickness"]),
-                aperture=float(e0["aperture"]),
-                k1=float(e0.get("k1", 0.0)),
-                k2=float(e0.get("k2", 0.0)),
-                A4_1=float(e0.get("A4_1", 0.0)),
-                A4_2=float(e0.get("A4_2", 0.0)),
+                R1=float(e["R1"]),
+                R2=float(e["R2"]),
+                thickness=thick,
+                aperture=float(e["aperture"]),
+                k1=float(e.get("k1", 0.0)),
+                k2=float(e.get("k2", 0.0)),
+                A4_1=float(e.get("A4_1", 0.0)),
+                A4_2=float(e.get("A4_2", 0.0)),
                 x0=0.0,
                 y0=0.0,
-                z_front=z0,
+                z_front=z,
                 R1y=float(r1y) if r1y is not None else None,
                 R2y=float(r2y) if r2y is not None else None,
-                mode=str(e0.get("surface_mode", "rotational")),
+                mode=str(e.get("surface_mode", "rotational")),
                 aperture_y=float(apy) if apy is not None else None,
             )
-        ], "singlet"
+        )
+        z += thick + float(e.get("air_after", 0.0))
 
-    from mla_geometry import build_mla_lens_specs
-
-    specs, _meta = build_mla_lens_specs(params, dies=dies)
-    return specs, "mla"
+    mode = "stack" if len(specs) > 1 else "singlet"
+    return specs, mode
 
 
 def write_step_multibody(path: str | Path, meshes: Sequence[Mesh], name: str = "OptiFlux_Optics") -> Path:
@@ -772,6 +782,11 @@ def export_lens(
     """
     Export lens geometry. fmt in {'stl','stl_ascii','step'}.
     All coordinates in millimetres.
+
+    - MLA → one monolithic plate solid
+    - Single element → one solid
+    - Multi-element stack → separate solid per element
+      (STEP multi-body; STL merges shells into one file with air gaps preserved in Z)
     """
     path = Path(path)
     specs, mode = build_lens_specs_from_params(params, dies)
@@ -791,12 +806,16 @@ def export_lens(
         )
         bodies = [mesh]
     else:
-        mesh = mesh_singlet(specs[0], n_radial=n_radial, n_theta=n_theta)
-        bodies = [mesh]
+        # One mesh body per enabled element (correct Z along the stack)
+        bodies = [mesh_singlet(s, n_radial=n_radial, n_theta=n_theta) for s in specs]
+        mesh = bodies[0]
+        for extra in bodies[1:]:
+            mesh = mesh.merge(extra)
 
     if fmt in ("stl", "stl_binary", "bin"):
         if path.suffix.lower() != ".stl":
             path = path.with_suffix(".stl")
+        # Binary STL is a triangle soup — all elements appear as separate shells
         return write_stl_binary(path, mesh)
     if fmt in ("stl_ascii", "ascii"):
         if path.suffix.lower() != ".stl":
@@ -805,5 +824,7 @@ def export_lens(
     if fmt in ("step", "stp"):
         if path.suffix.lower() not in (".step", ".stp"):
             path = path.with_suffix(".step")
-        return write_step_mesh(path, mesh)
+        if len(bodies) > 1:
+            return write_step_multibody(path, bodies, name="OptiFlux_LensStack")
+        return write_step_mesh(path, bodies[0])
     raise ValueError(f"Unknown format: {fmt}")

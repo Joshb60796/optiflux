@@ -746,11 +746,13 @@ class IrradianceMap:
         sum_e = 0.0
         sum_e2 = 0.0
         n_bins = 0
+        n_lit = 0  # FOV bins above noise floor
         area = self.bin_area
-        # power-weighted second moments for footprint aspect
+        # power-weighted second moments for footprint aspect / size
         sum_p = 0.0
         sum_x2 = 0.0
         sum_y2 = 0.0
+        fov_irrad: List[float] = []
         for iy in range(self.ny):
             for ix in range(self.nx):
                 x = -self.half_w + (ix + 0.5) * dx
@@ -764,6 +766,7 @@ class IrradianceMap:
                     continue
                 power_in += p
                 e = p / area
+                fov_irrad.append(e)
                 min_e = min(min_e, e)
                 max_e = max(max_e, e)
                 sum_e += e
@@ -775,6 +778,22 @@ class IrradianceMap:
         footprint_aspect = sig_x / max(sig_y, 1e-12)
         target_aspect = float(fov_w) / max(float(fov_h), 1e-12)
         aspect_error = abs(footprint_aspect - target_aspect) / max(target_aspect, 1e-12)
+
+        # Ideal RMS half-widths for a *uniform* rectangle of size fov_w × fov_h:
+        #   σ = (half-width) / √3
+        # Under-fill (σ too small) is penalized harder than mild over-fill.
+        sig_tgt_x = (0.5 * float(fov_w)) / math.sqrt(3.0)
+        sig_tgt_y = (0.5 * float(fov_h)) / math.sqrt(3.0)
+
+        def _size_err(sig: float, tgt: float) -> float:
+            if tgt < 1e-9:
+                return 0.0
+            ratio = sig / tgt
+            if ratio < 1.0:
+                return (1.0 - ratio) ** 2  # under-fill
+            return 0.35 * (ratio - 1.0) ** 2  # over-fill (softer)
+
+        size_error = 0.5 * (_size_err(sig_x, sig_tgt_x) + _size_err(sig_y, sig_tgt_y))
 
         if n_bins == 0:
             return {
@@ -790,25 +809,45 @@ class IrradianceMap:
                 "aspect_error": aspect_error,
                 "sig_x": sig_x,
                 "sig_y": sig_y,
+                "coverage": 0.0,
+                "size_error": 1.0,
             }
         mean_e = sum_e / n_bins
         var_e = sum_e2 / n_bins - mean_e * mean_e
         std_e = math.sqrt(max(0.0, var_e))
         if min_e == float("inf"):
             min_e = 0.0
+        # Coverage: fraction of FOV bins with irradiance ≥ 10% of peak-in-FOV
+        # (empty bins from under-fill count against coverage)
+        peak_fov = max_e if max_e > 1e-30 else 0.0
+        thr = 0.10 * peak_fov
+        if peak_fov > 0:
+            n_lit = sum(1 for e in fov_irrad if e >= thr)
+            coverage = n_lit / max(n_bins, 1)
+        else:
+            coverage = 0.0
+        # Uniformity only over lit bins so a small hot-spot is not "0% uniform"
+        # solely because empty FOV corners dominate min_e.
+        lit = [e for e in fov_irrad if e >= thr] if thr > 0 else []
+        if len(lit) >= 2:
+            uni = min(lit) / max(lit) if max(lit) > 1e-30 else 0.0
+        else:
+            uni = 0.0
         return {
             "power_in": power_in,
             "fraction": power_in / self.total_power if self.total_power > 0 else 0.0,
             "min_e": min_e,
             "max_e": max_e,
             "mean_e": mean_e,
-            "uniformity": min_e / max_e if max_e > 1e-30 else 0.0,
+            "uniformity": uni,
             "cv": std_e / mean_e if mean_e > 1e-30 else 0.0,
             "footprint_aspect": footprint_aspect,
             "target_aspect": target_aspect,
             "aspect_error": aspect_error,
             "sig_x": sig_x,
             "sig_y": sig_y,
+            "coverage": coverage,
+            "size_error": size_error,
         }
 
 
@@ -1034,6 +1073,7 @@ def run_simulation(params: Dict[str, Any], progress_cb=None) -> SimResult:
     fov_h = float(params.get("fov_height", 32.0))
     fov_cx = float(params.get("fov_cx", 0.0))
     fov_cy = float(params.get("fov_cy", 0.0))
+    use_warp = bool(params.get("use_warp", True))
 
     active = [d for d in dies if d.enabled and d.flux > 0]
     paths: List[RayPath] = []
@@ -1046,8 +1086,48 @@ def run_simulation(params: Dict[str, Any], progress_cb=None) -> SimResult:
     launched = hit = 0
     n_tir = n_reflect = n_backward = n_miss = 0
     batch = max(50, total_rays // 30)
+    backend = "cpu"
 
-    for i in range(total_rays):
+    # ── Optional NVIDIA Warp acceleration for the irradiance map ──────────
+    # Display paths (side-view) always use the pure-Python tracer so history
+    # and event labels remain exact. The bulk Monte-Carlo deposit runs on
+    # GPU when Warp + CUDA are available (or on Warp's CPU backend).
+    warp_grid = None
+    warp_stats = None
+    if use_warp and total_rays >= 2000:
+        try:
+            from warp_backend import try_accelerate, warp_available, warp_device_info
+            if warp_available() or True:  # allow Warp CPU backend too
+                def _prog(f):
+                    if progress_cb:
+                        progress_cb(0.05 + 0.85 * f)
+                warp_grid, warp_stats = try_accelerate(
+                    params, dies, surfaces, progress_cb=_prog
+                )
+                if warp_grid is not None:
+                    backend = warp_stats.get("backend", "warp")
+                    # Inject Warp grid into IrradianceMap.
+                    # Warp kernel deposits with iy increasing with +Y; IrradianceMap
+                    # stores row 0 at +Y (origin=upper for imshow). Flip vertically.
+                    import numpy as _np
+                    g = _np.asarray(warp_grid, dtype=float)
+                    if g.ndim == 2 and g.shape == (imap.ny, imap.nx):
+                        g = _np.flipud(g)
+                    flat = g.ravel()
+                    if len(flat) == len(imap.bins):
+                        imap.bins = list(flat)
+                        imap.total_power = float(flat.sum())
+                        imap.hit_count = int(warp_stats.get("hit", 0))
+                    launched = int(warp_stats.get("launched", total_rays))
+                    hit = int(warp_stats.get("hit", 0))
+        except Exception as exc:
+            # Keep going with CPU; print once for diagnostics
+            print(f"[OptiFlux] Warp path skipped: {exc}")
+
+    # Always run a modest Python batch so side-view paths & TIR counters stay accurate
+    n_python = max_display * 3 if warp_grid is not None else total_rays
+    n_python = min(n_python, total_rays)
+    for i in range(n_python):
         r = random.random() * total_f
         die = active[0]
         for dd in active:
@@ -1055,9 +1135,9 @@ def run_simulation(params: Dict[str, Any], progress_cb=None) -> SimResult:
             if r <= 0:
                 die = dd
                 break
-        o, d, pwr, wl = die.spawn_ray(power_per)
+        o, d, pwr, wl = die.spawn_ray(power_per if warp_grid is None else total_f / n_python)
         store = len(paths) < max_display and (
-            random.random() < (max_display / max(total_rays, 1)) * 1.4 or len(paths) < 40
+            random.random() < (max_display / max(n_python, 1)) * 1.4 or len(paths) < 40
         )
         ok, pt, pwr_out, path = trace_ray(
             o,
@@ -1073,7 +1153,8 @@ def run_simulation(params: Dict[str, Any], progress_cb=None) -> SimResult:
             max_reflections=max_refl,
             kill_backward=kill_backward,
         )
-        launched += 1
+        if warp_grid is None:
+            launched += 1
         if path is not None:
             if path.terminated == "tir_absorb":
                 n_tir += 1
@@ -1082,13 +1163,18 @@ def run_simulation(params: Dict[str, Any], progress_cb=None) -> SimResult:
             elif path.terminated == "miss":
                 n_miss += 1
             n_reflect += path.n_reflections
-        if ok and pt is not None:
+        if warp_grid is None and ok and pt is not None:
             hit += 1
             imap.deposit(pt[0], pt[1], pwr_out)
         if store and path is not None and len(path.history) >= 2:
             paths.append(path)
-        if progress_cb and (i % batch == 0 or i == total_rays - 1):
-            progress_cb((i + 1) / total_rays)
+        if progress_cb and warp_grid is None and (i % batch == 0 or i == n_python - 1):
+            progress_cb((i + 1) / n_python)
+        elif progress_cb and warp_grid is not None and i == n_python - 1:
+            progress_cb(1.0)
+
+    if warp_grid is not None and launched == 0:
+        launched = total_rays
 
     cx, cy, _ = imap.centroid()
     fov = imap.fov_metrics(fov_w, fov_h, fov_cx, fov_cy)
@@ -1121,6 +1207,7 @@ def run_simulation(params: Dict[str, Any], progress_cb=None) -> SimResult:
         "n_reflections": n_reflect,
         "n_backward": n_backward,
         "n_miss": n_miss,
+        "backend": backend,
     }
     return SimResult(imap, paths, stats, dies, surfaces)
 

@@ -27,6 +27,7 @@ from engine import (
     run_simulation,
     SimResult,
 )
+from progressive import run_simulation_progressive
 from materials_catalog import (
     VISIBLE_NM_DEFAULT,
     VISIBLE_NM_MAX,
@@ -48,6 +49,7 @@ from rect_fov import (
     fov_aspect,
     set_fov_from_aspect,
 )
+from optimizer import OptimizeConfig, optimize_fov_flux
 
 
 # ── Theme ────────────────────────────────────────────────────────────────────
@@ -210,7 +212,14 @@ class OptiFluxApp(tk.Tk):
         self.result: Optional[SimResult] = None
         self._run_lock = threading.Lock()
         self._running = False
+        self._trace_gen = 0  # bumps on every new progressive run (cancels prior)
         self._debounce_id = None
+        self._opt_gen = 0  # bumps to cancel an in-flight optimizer
+        self._optimizing = False
+        # Progressive defaults: 5 batches × 5000 map rays + 500 side paths
+        self.prog_batches = 5
+        self.prog_rays_batch = 5000
+        self.prog_disp_batch = 500
         self.auto_run = tk.BooleanVar(value=True)
         self.log_scale = tk.BooleanVar(value=False)
         # Side-view lens drag (recalculate only on mouse release)
@@ -441,6 +450,9 @@ class OptiFluxApp(tk.Tk):
 
         ttk.Button(header, text="Trace rays", style="Accent.TButton", command=self.run_trace).pack(
             side="right", padx=10, pady=8
+        )
+        ttk.Button(header, text="Optimize FOV", command=self.run_optimize).pack(
+            side="right", padx=4, pady=8
         )
         ttk.Checkbutton(header, text="Auto-run", variable=self.auto_run).pack(side="right", padx=6)
         ttk.Button(header, text="Export STL…", command=lambda: self.export_cad("stl")).pack(
@@ -866,6 +878,98 @@ class OptiFluxApp(tk.Tk):
             wraplength=290,
         ).pack(anchor="w", padx=8, pady=4)
 
+        # Optimizer — maximize power into the rectangular FOV
+        optz = ttk.LabelFrame(parent, text="OPTIMIZER  ·  rectangular FOV flux")
+        optz.pack(fill="x", padx=8, pady=6)
+        ttk.Label(
+            optz,
+            text=(
+                "Objective fills the rectangular FOV: flux × coverage × uniformity, "
+                "penalizing under-size and wrong aspect. Multi-starts several group "
+                "distances (near LED → farther) so conjugate scale is explored. "
+                "Phase 2 adds anamorphic lenses for a rectangular footprint."
+            ),
+            style="Dim.TLabel",
+            wraplength=300,
+        ).pack(anchor="w", padx=6, pady=2)
+        self.v_opt_rays = tk.IntVar(value=2500)
+        self.v_opt_evals = tk.IntVar(value=80)
+        self.v_opt_uni_w = tk.DoubleVar(value=0.35)
+        self.v_opt_aspect_w = tk.DoubleVar(value=1.5)
+        self.v_opt_fill_w = tk.DoubleVar(value=1.5)
+        self.v_opt_two_phase = tk.BooleanVar(value=True)
+        self.v_opt_extra = tk.IntVar(value=2)
+        self.v_opt_ana_mode = tk.StringVar(value="crossed")
+        self.v_opt_asphere = tk.BooleanVar(value=False)
+        self.v_opt_polish = tk.BooleanVar(value=True)
+        self._add_slider(optz, "Rays per evaluation", self.v_opt_rays, 500, 15000, 500, True)
+        self._add_slider(optz, "Max evaluations (approx.)", self.v_opt_evals, 20, 300, 10, True)
+        self._add_slider(optz, "Uniformity weight", self.v_opt_uni_w, 0.0, 2.0, 0.05)
+        self._add_slider(
+            optz,
+            "FOV-fill weight (size match; under-fill hurts)",
+            self.v_opt_fill_w,
+            0.0,
+            4.0,
+            0.1,
+        )
+        self._add_slider(optz, "Aspect-match weight (phase 2)", self.v_opt_aspect_w, 0.0, 4.0, 0.1)
+        ttk.Checkbutton(
+            optz,
+            text="Two-phase: even FOV → add anamorphic lenses",
+            variable=self.v_opt_two_phase,
+        ).pack(anchor="w", padx=6)
+        self._add_slider(
+            optz,
+            "Extra anamorphic lenses (phase 2)",
+            self.v_opt_extra,
+            0,
+            2,
+            1,
+            True,
+        )
+        ttk.Label(optz, text="Anamorphic form", style="Dim.TLabel").pack(
+            anchor="w", padx=6, pady=(4, 0)
+        )
+        ana_cb = self._make_combobox(
+            optz,
+            self.v_opt_ana_mode,
+            ["crossed", "biconic"],
+            width=28,
+        )
+        ana_cb.pack(fill="x", padx=6, pady=2)
+        ttk.Label(
+            optz,
+            text="crossed = cylinder X + cylinder Y · biconic = one Rx≠Ry singlet",
+            style="Dim.TLabel",
+            wraplength=300,
+        ).pack(anchor="w", padx=6)
+        ttk.Checkbutton(
+            optz,
+            text="Also optimize conic k & A4 asphere terms",
+            variable=self.v_opt_asphere,
+        ).pack(anchor="w", padx=6)
+        ttk.Checkbutton(
+            optz,
+            text="Local polish after global search (Nelder–Mead)",
+            variable=self.v_opt_polish,
+        ).pack(anchor="w", padx=6)
+        btn_row = ttk.Frame(optz)
+        btn_row.pack(fill="x", padx=6, pady=4)
+        ttk.Button(
+            btn_row,
+            text="Optimize rectangular FOV",
+            style="Accent.TButton",
+            command=self.run_optimize,
+        ).pack(side="left", padx=(0, 6))
+        ttk.Button(btn_row, text="Cancel", command=self.cancel_optimize).pack(side="left")
+        self.opt_status = tk.StringVar(
+            value="Two-phase on: P1 even illumination, P2 reshape to FOV rectangle."
+        )
+        ttk.Label(
+            optz, textvariable=self.opt_status, style="Dim.TLabel", wraplength=300
+        ).pack(anchor="w", padx=6, pady=2)
+
     def _build_metrics(self, parent):
         ttk.Label(parent, text="SPOT & FLUX METRICS", style="Head.TLabel").pack(
             anchor="w", padx=12, pady=(12, 8)
@@ -888,6 +992,7 @@ class OptiFluxApp(tk.Tk):
             ("efl", "Element 1 EFL (lensmaker)"),
             ("dies", "Active dies / surfaces"),
             ("tir", "TIR absorbed / reflections"),
+            ("backend", "Trace backend"),
         ]
         for key, title in items:
             card = tk.Frame(parent, bg=BG3, highlightbackground=BORDER, highlightthickness=1)
@@ -1004,31 +1109,107 @@ class OptiFluxApp(tk.Tk):
     def _first_run(self):
         self.run_trace()
 
-    def run_trace(self):
-        if self._running:
-            return
-        if not self._run_lock.acquire(blocking=False):
-            return
-        self._running = True
-        self.status_var.set("Tracing…")
-        self.progress["value"] = 0
+    def run_trace(self, *, _resume_gen: Optional[int] = None):
+        """Start progressive Monte Carlo (cancels any in-flight refinement).
+
+        _resume_gen: internal — reuse an existing generation after waiting for
+        a previous worker to release the lock (do not bump counter again).
+        """
+        if _resume_gen is None:
+            self._trace_gen += 1
+            gen = self._trace_gen
+        else:
+            if _resume_gen != self._trace_gen:
+                return  # superseded while waiting
+            gen = _resume_gen
         params = self.collect_params()
+
+        acquired = self._run_lock.acquire(blocking=False)
+        if not acquired:
+            # Previous worker still holds the lock — it will exit on cancel;
+            # schedule a retry shortly so the new gen actually runs.
+            self.after(80, lambda g=gen: self._retry_trace_if_current(g))
+            self.status_var.set(f"Waiting to start batch 1/{self.prog_batches}…")
+            return
+
+        self._running = True
+        self.status_var.set(f"Tracing batch 1/{self.prog_batches}…")
+        self.progress["value"] = 0
 
         def work():
             def prog(f):
-                self.after(0, lambda: self.progress.configure(value=f * 100))
+                self.after(0, lambda v=f: self.progress.configure(value=v * 100))
+
+            def should_cancel():
+                return gen != self._trace_gen
+
+            def on_batch(result, bi, n_batches):
+                if gen != self._trace_gen:
+                    return
+                self.after(0, lambda r=result, b=bi, n=n_batches: self._on_batch(r, b, n, gen))
 
             try:
-                result = run_simulation(params, progress_cb=prog)
-                self.after(0, lambda: self._on_done(result, None))
+                run_simulation_progressive(
+                    params,
+                    batch_cb=on_batch,
+                    n_batches=self.prog_batches,
+                    rays_per_batch=self.prog_rays_batch,
+                    display_per_batch=self.prog_disp_batch,
+                    progress_cb=prog,
+                    should_cancel=should_cancel,
+                )
+                self.after(0, lambda: self._on_progressive_finished(gen, None))
             except Exception as e:
-                self.after(0, lambda: self._on_done(None, e))
+                self.after(0, lambda: self._on_progressive_finished(gen, e))
 
         threading.Thread(target=work, daemon=True).start()
 
-    def _on_done(self, result: Optional[SimResult], err: Optional[BaseException]):
+    def _retry_trace_if_current(self, gen: int):
+        if gen != self._trace_gen:
+            return
+        self.run_trace(_resume_gen=gen)
+
+    def _on_batch(self, result: SimResult, batch_i: int, n_batches: int, gen: int):
+        """Intermediate progressive update — only apply if still current gen."""
+        if gen != self._trace_gen:
+            return
+        self.result = result
+        st = result.stats
+        more = batch_i < n_batches
+        if more:
+            self.status_var.set(
+                f"Batch {batch_i}/{n_batches} · {st['hit']:,} hits / {st['launched']:,} rays · {st.get('backend', 'cpu')}"
+            )
+        else:
+            self.status_var.set(
+                f"Done · {st['hit']:,} hits / {st['launched']:,} rays · {st['n_dies']} dies · {st.get('backend', 'cpu')}"
+            )
+        self.progress["value"] = 100.0 * batch_i / max(n_batches, 1)
+        self._update_metrics(st)
+        self._redraw()
+
+    def _on_progressive_finished(self, gen: int, err: Optional[BaseException]):
+        # Always release the lock this worker acquired, even if superseded.
         self._running = False
-        self._run_lock.release()
+        try:
+            self._run_lock.release()
+        except Exception:
+            pass
+        if gen != self._trace_gen:
+            return  # superseded — ignore error/UI for this gen
+        if err is not None:
+            self.status_var.set(f"Error: {err}")
+            messagebox.showerror("Simulation error", str(err))
+        else:
+            self.progress["value"] = 100
+
+    def _on_done(self, result: Optional[SimResult], err: Optional[BaseException]):
+        """Legacy single-shot completion (kept for safety)."""
+        self._running = False
+        try:
+            self._run_lock.release()
+        except Exception:
+            pass
         self.progress["value"] = 100
         if err is not None:
             self.status_var.set(f"Error: {err}")
@@ -1037,7 +1218,7 @@ class OptiFluxApp(tk.Tk):
         self.result = result
         st = result.stats
         self.status_var.set(
-            f"Done · {st['hit']:,} hits / {st['launched']:,} rays · {st['n_dies']} dies"
+            f"Done · {st['hit']:,} hits / {st['launched']:,} rays · {st['n_dies']} dies · {st.get('backend', 'cpu')}"
         )
         self._update_metrics(st)
         self._redraw()
@@ -1070,6 +1251,7 @@ class OptiFluxApp(tk.Tk):
         self.metric_labels["tir"].set(
             f"{st.get('n_tir_absorb', 0)} / {st.get('n_reflections', 0)}"
         )
+        self.metric_labels["backend"].set(str(st.get("backend", "cpu")))
 
     # ── Drawing ──────────────────────────────────────────────────────────
 
@@ -1742,6 +1924,12 @@ class OptiFluxApp(tk.Tk):
                 if len(path.history) < 2:
                     continue
                 ev = getattr(path, "events", None) or []
+                # Rays that never refracted miss the clear aperture / optics —
+                # draw them nearly transparent so in-lens paths stay readable.
+                through_lens = int(getattr(path, "n_refractions", 0) or 0) > 0 or any(
+                    e == "refract" for e in ev
+                )
+                miss_scale = 1.0 if through_lens else 0.12
                 for j in range(len(path.history) - 1):
                     p0, p1 = path.history[j], path.history[j + 1]
                     kind = ev[j] if j < len(ev) else "refract"
@@ -1753,13 +1941,16 @@ class OptiFluxApp(tk.Tk):
                         col, al, lw = "#64748b", 0.25, 0.5
                     else:
                         col, al, lw = "#7dd3fc", 0.35, 0.7
+                    al = max(0.04, al * miss_scale)
+                    if not through_lens:
+                        lw = min(lw, 0.55)
                     ax.plot(
                         [p0[2], p1[2]],
                         [p0[1], p1[1]],
                         color=col,
                         alpha=al,
                         lw=lw,
-                        zorder=2,
+                        zorder=2 if through_lens else 1,
                     )
 
         ax.axvline(target_z, color=TARGET, ls="--", lw=1.4, zorder=4)
@@ -1992,6 +2183,133 @@ class OptiFluxApp(tk.Tk):
     def reset_defaults(self):
         self.params = default_params()
         self._apply_params_to_vars(self.params)
+        self.run_trace()
+
+    def cancel_optimize(self):
+        """Signal the background optimizer to stop after the current evaluation."""
+        if self._optimizing:
+            self._opt_gen += 1
+            self.opt_status.set("Cancel requested — finishing current evaluation…")
+            self.status_var.set("Optimizer cancel requested…")
+
+    def run_optimize(self):
+        """
+        Background search for rectangular FOV illumination.
+
+        Single-phase: tune current elements for FOV flux (+ uniformity / aspect).
+        Two-phase: (1) even light in FOV, (2) add N anamorphic lenses and match
+        footprint aspect to the rectangular FOV (not limited to a circular zone).
+        """
+        if self._optimizing:
+            messagebox.showinfo(
+                "Optimizer",
+                "An optimization is already running. Press Cancel first, or wait.",
+            )
+            return
+        try:
+            from scipy.optimize import differential_evolution  # noqa: F401
+        except ImportError:
+            messagebox.showerror(
+                "Missing dependency",
+                "The optimizer needs SciPy.\n\nInstall with:\n  pip install scipy",
+            )
+            return
+
+        self._opt_gen += 1
+        gen = self._opt_gen
+        self._optimizing = True
+        was_auto = bool(self.auto_run.get())
+        self.auto_run.set(False)
+
+        params = self.collect_params()
+        two_phase = bool(self.v_opt_two_phase.get())
+        extra = int(self.v_opt_extra.get())
+        cfg = OptimizeConfig(
+            rays_per_eval=int(self.v_opt_rays.get()),
+            max_evals=int(self.v_opt_evals.get()),
+            uniformity_weight=float(self.v_opt_uni_w.get()),
+            aspect_weight=float(self.v_opt_aspect_w.get()),
+            fill_weight=float(self.v_opt_fill_w.get()),
+            coverage_mix=0.75,
+            two_phase=two_phase,
+            extra_anamorphic_lenses=extra,
+            anamorphic_mode=str(self.v_opt_ana_mode.get() or "crossed"),
+            polish=bool(self.v_opt_polish.get()),
+            optimize_asphere=bool(self.v_opt_asphere.get()),
+            optimize_lens_z=True,
+            force_cpu=True,
+            seed=42,
+        )
+
+        if two_phase and extra > 0:
+            self.opt_status.set(
+                f"Phase 1 → even FOV light; Phase 2 → +{extra} anamorphic lens(es)…"
+            )
+            self.status_var.set("Two-phase rectangular FOV optimize…")
+        else:
+            self.opt_status.set("Starting FOV-flux optimizer…")
+            self.status_var.set("Optimizing FOV flux…")
+        self.progress["value"] = 0
+
+        def progress_cb(frac: float, msg: str, best: float):
+            if gen != self._opt_gen:
+                return
+            self.after(
+                0,
+                lambda: (
+                    self.progress.configure(value=frac * 100),
+                    self.opt_status.set(msg),
+                    self.status_var.set(msg),
+                ),
+            )
+
+        def should_cancel():
+            return gen != self._opt_gen
+
+        cfg.progress_cb = progress_cb
+        cfg.should_cancel = should_cancel
+
+        def work():
+            err = None
+            result = None
+            try:
+                result = optimize_fov_flux(params, cfg)
+            except Exception as e:
+                err = e
+            self.after(0, lambda: self._on_optimize_done(gen, result, err, was_auto))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_optimize_done(self, gen: int, result, err, was_auto: bool):
+        self._optimizing = False
+        self.progress["value"] = 100
+        if gen != self._opt_gen and result is None and err is None:
+            self.auto_run.set(was_auto)
+            self.opt_status.set("Optimizer cancelled.")
+            self.status_var.set("Ready")
+            return
+        if err is not None:
+            self.auto_run.set(was_auto)
+            self.opt_status.set(f"Error: {err}")
+            self.status_var.set(f"Optimizer error: {err}")
+            messagebox.showerror("Optimizer error", str(err))
+            return
+        if result is None:
+            self.auto_run.set(was_auto)
+            self.opt_status.set("Optimizer returned no result.")
+            return
+
+        self._apply_params_to_vars(result.params)
+        self.params = result.params
+        msg = (
+            f"FOV flux {result.fov_flux * 100:.1f}% · "
+            f"uniform {result.uniformity * 100:.1f}% · "
+            f"aspect err {result.aspect_error * 100:.1f}% · "
+            f"{result.n_evals} evals in {result.elapsed_s:.0f}s"
+        )
+        self.opt_status.set(msg)
+        self.status_var.set(result.message or msg)
+        self.auto_run.set(was_auto)
         self.run_trace()
 
     def _apply_params_to_vars(self, p: Dict[str, Any]):
@@ -2238,16 +2556,23 @@ class OptiFluxApp(tk.Tk):
                 include_plate=bool(self.v_export_plate.get()),
             )
             mla_on = bool(params.get("mla", {}).get("enabled"))
-            mla_note = (
-                "MLA: monolithic plate with Element-1 form lenslets (scaled to die pitch)"
-                if mla_on
-                else "Single lens export"
-            )
+            n_en = sum(1 for e in params.get("elements", []) if e.get("enabled", True))
+            if mla_on:
+                geom_note = (
+                    "MLA: monolithic plate with Element-1 form lenslets (scaled to die pitch)"
+                )
+            elif n_en > 1:
+                geom_note = (
+                    f"Lens stack: {n_en} separate elements at correct Z spacings "
+                    f"(STEP multi-body; STL multi-shell)"
+                )
+            else:
+                geom_note = "Single lens export"
             messagebox.showinfo(
                 "Export complete",
                 f"Wrote {out}\n\nUnits: millimetres (mm)\n"
                 f"Surfaces use the same aspheric sag model as the ray tracer.\n"
-                f"{mla_note}",
+                f"{geom_note}",
             )
             self.status_var.set(f"Exported {out.name}")
         except Exception as e:

@@ -1,2 +1,7 @@
 matplotlib>=3.7
 numpy>=1.24
+scipy>=1.10
+# Optional GPU acceleration (NVIDIA Warp)
+#   pip install warp-lang
+# Requires a CUDA-capable GPU for best performance; falls back to Warp CPU or pure Python.
+warp-lang>=1.0; platform_system != "Darwin" or platform_machine != "arm64"
