@@ -430,8 +430,11 @@ def build_surfaces(
             return surfaces
         # Shared geometry with CAD: Element 1 form scaled to die pitch
         from mla_geometry import (
+            channel_aim_to_fov,
+            die_pitch_mm,
             lenslet_semi_aperture,
             scale_element_to_lenslet,
+            thin_lens_focal_length_mm,
         )
 
         ap = lenslet_semi_aperture(mla, dies)
@@ -460,12 +463,38 @@ def build_surfaces(
         z1 = z_start
         z2 = z_start + float(g["thickness"])
         ap_use = float(g["aperture"])
+        # Per-channel aim toward FOV center (lens optical-center offset)
+        aim_on = bool(mla.get("aim_to_fov", True))
+        strength = float(mla.get("aim_strength", 1.0)) if aim_on else 0.0
+        n_glass = refractive_index(mat, VISIBLE_NM_DEFAULT, 1.5)
+        f_mm = thin_lens_focal_length_mm(g["R1"], g["R2"], n_glass, g["thickness"])
+        pitch = die_pitch_mm(dies) if len(dies) >= 2 else max(2.0 * ap_use, 1.6)
+        # FOV / throw come from optional keys stashed on mla dict by run_simulation
+        target_z = float(mla.get("_target_z", 80.0))
+        fov_cx = float(mla.get("_fov_cx", 0.0))
+        fov_cy = float(mla.get("_fov_cy", 0.0))
         for li, die in enumerate(dies):
+            if aim_on and strength > 0:
+                x0, y0, _tx, _ty = channel_aim_to_fov(
+                    die.cx,
+                    die.cy,
+                    die.cz,
+                    lens_z=z1,
+                    target_z=target_z,
+                    fov_cx=fov_cx,
+                    fov_cy=fov_cy,
+                    focal_length=f_mm,
+                    aperture=ap_use,
+                    pitch=pitch,
+                    aim_strength=strength,
+                )
+            else:
+                x0, y0 = die.cx, die.cy
             s1 = _surface_from_element(
-                e_lens, side=1, z=z1, ap=ap_use, glass=mat, label=f"MLA{li}S1", x0=die.cx, y0=die.cy
+                e_lens, side=1, z=z1, ap=ap_use, glass=mat, label=f"MLA{li}S1", x0=x0, y0=y0
             )
             s2 = _surface_from_element(
-                e_lens, side=2, z=z2, ap=ap_use, glass=mat, label=f"MLA{li}S2", x0=die.cx, y0=die.cy
+                e_lens, side=2, z=z2, ap=ap_use, glass=mat, label=f"MLA{li}S2", x0=x0, y0=y0
             )
             _clamp_pair_aperture(s1, s2, ap_use, min_edge=0.08)
             surfaces.extend([s1, s2])
@@ -617,6 +646,34 @@ def _surface_from_element(
 
 # ── Ray / irradiance ─────────────────────────────────────────────────────────
 
+def element_id_from_label(label: str) -> str:
+    """Map surface label (E1S1, MLA3S2) to element id (E1, MLA3)."""
+    lab = str(label or "")
+    if not lab:
+        return ""
+    if lab.startswith("MLA"):
+        return lab.rsplit("S", 1)[0]
+    if "S" in lab:
+        return lab.rsplit("S", 1)[0]
+    return lab
+
+
+def path_in_meridional_slice(path: "RayPath", slice_half_mm: float) -> bool:
+    """
+    True if the path stays near the Y–Z plane (|X| ≤ slice_half_mm).
+
+    Used by the side-view plot so rays with large |X| are not projected onto
+    the lens silhouette (they can miss a circular aperture while looking like
+    they cross every element in Y–Z).
+    """
+    if slice_half_mm <= 0:
+        return True
+    hist = getattr(path, "history", None) or []
+    if not hist:
+        return False
+    return max(abs(float(pt[0])) for pt in hist) <= float(slice_half_mm)
+
+
 @dataclass
 class RayPath:
     history: List[Vec3] = field(default_factory=list)
@@ -626,6 +683,8 @@ class RayPath:
     n_reflections: int = 0
     n_refractions: int = 0
     terminated: str = ""  # target | tir_absorb | miss | power | bounce_limit | backward
+    # Distinct element ids (E1, E2, MLA0, …) that this ray refracted through
+    elements_hit: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -779,8 +838,23 @@ class IrradianceMap:
         target_aspect = float(fov_w) / max(float(fov_h), 1e-12)
         aspect_error = abs(footprint_aspect - target_aspect) / max(target_aspect, 1e-12)
 
+        # Landscape FOV (W>H) must not accept a portrait beam (σx<σy), and vice
+        # versa. |aspect−target| alone is not enough: DE can keep an inverted
+        # beam if flux is higher. Flag flips and inflate aspect_error.
+        orientation_flipped = 0.0
+        if abs(target_aspect - 1.0) > 0.02 and abs(footprint_aspect - 1.0) > 0.02:
+            if (target_aspect - 1.0) * (footprint_aspect - 1.0) < 0.0:
+                orientation_flipped = 1.0
+                aspect_error = max(
+                    aspect_error,
+                    abs(1.0 / max(footprint_aspect, 1e-6) - target_aspect)
+                    / max(target_aspect, 1e-12)
+                    + 0.5,
+                )
+
         # Ideal RMS half-widths for a *uniform* rectangle of size fov_w × fov_h:
         #   σ = (half-width) / √3
+        # Axis-resolved so X and Y cannot be swapped without cost.
         # Under-fill (σ too small) is penalized harder than mild over-fill.
         sig_tgt_x = (0.5 * float(fov_w)) / math.sqrt(3.0)
         sig_tgt_y = (0.5 * float(fov_h)) / math.sqrt(3.0)
@@ -794,6 +868,8 @@ class IrradianceMap:
             return 0.35 * (ratio - 1.0) ** 2  # over-fill (softer)
 
         size_error = 0.5 * (_size_err(sig_x, sig_tgt_x) + _size_err(sig_y, sig_tgt_y))
+        if orientation_flipped > 0.0:
+            size_error = size_error + 0.5
 
         if n_bins == 0:
             return {
@@ -811,6 +887,10 @@ class IrradianceMap:
                 "sig_y": sig_y,
                 "coverage": 0.0,
                 "size_error": 1.0,
+                "orientation_flipped": 1.0,
+                "profile_fill": 0.0,
+                "profile_fill_x": 0.0,
+                "profile_fill_y": 0.0,
             }
         mean_e = sum_e / n_bins
         var_e = sum_e2 / n_bins - mean_e * mean_e
@@ -833,6 +913,42 @@ class IrradianceMap:
             uni = min(lit) / max(lit) if max(lit) > 1e-30 else 0.0
         else:
             uni = 0.0
+
+        # Line-cut (profile) fill — same quantities shown in the profile plot.
+        # X-cut at FOV centre Y, Y-cut at FOV centre X: fraction of FOV span
+        # where the cut is ≥ 10% of that cut's peak.
+        def _profile_fill_1d(along_x: bool) -> float:
+            if along_x:
+                # row nearest fov_cy
+                row = int(round((self.half_h - fov_cy) / max(dy, 1e-12) - 0.5))
+                row = max(0, min(self.ny - 1, row))
+                vals = [self.bins[row * self.nx + ix] for ix in range(self.nx)]
+                coords = [-self.half_w + (ix + 0.5) * dx for ix in range(self.nx)]
+                half = 0.5 * float(fov_w)
+                c0 = float(fov_cx)
+            else:
+                col = int(round((fov_cx + self.half_w) / max(dx, 1e-12) - 0.5))
+                col = max(0, min(self.nx - 1, col))
+                vals = [self.bins[iy * self.nx + col] for iy in range(self.ny)]
+                coords = [self.half_h - (iy + 0.5) * dy for iy in range(self.ny)]
+                half = 0.5 * float(fov_h)
+                c0 = float(fov_cy)
+            in_fov = [
+                (v, c) for v, c in zip(vals, coords) if abs(c - c0) <= half + 1e-9
+            ]
+            if not in_fov:
+                return 0.0
+            peak = max(v for v, _ in in_fov)
+            if peak <= 1e-30:
+                return 0.0
+            thr_p = 0.10 * peak
+            lit_n = sum(1 for v, _ in in_fov if v >= thr_p)
+            return lit_n / max(len(in_fov), 1)
+
+        profile_fill_x = _profile_fill_1d(True)
+        profile_fill_y = _profile_fill_1d(False)
+        profile_fill = 0.5 * (profile_fill_x + profile_fill_y)
+
         return {
             "power_in": power_in,
             "fraction": power_in / self.total_power if self.total_power > 0 else 0.0,
@@ -848,6 +964,10 @@ class IrradianceMap:
             "sig_y": sig_y,
             "coverage": coverage,
             "size_error": size_error,
+            "orientation_flipped": orientation_flipped,
+            "profile_fill": profile_fill,
+            "profile_fill_x": profile_fill_x,
+            "profile_fill_y": profile_fill_y,
         }
 
 
@@ -911,6 +1031,8 @@ def trace_ray(
     n_med = refractive_index("AIR", wavelength_nm, custom_n)
     history: List[Vec3] = [o] if store_path else []
     events: List[str] = []
+    elements_hit: List[str] = []
+    elements_hit_set: set = set()
     last_hit_i: Optional[int] = None
     n_refl = 0
     n_refr = 0
@@ -926,6 +1048,7 @@ def trace_ray(
             n_reflections=n_refl,
             n_refractions=n_refr,
             terminated=term,
+            elements_hit=list(elements_hit),
         )
 
     while guard < max_interactions:
@@ -1015,6 +1138,11 @@ def trace_ray(
             continue
 
         n_refr += 1
+        if store_path and best_s is not None:
+            eid = element_id_from_label(getattr(best_s, "label", "") or "")
+            if eid and eid not in elements_hit_set:
+                elements_hit_set.add(eid)
+                elements_hit.append(eid)
         if apply_fresnel:
             T, fr_tir = fresnel_T(n1, n2, cosi)
             if fr_tir:
@@ -1050,13 +1178,31 @@ class SimResult:
 
 def run_simulation(params: Dict[str, Any], progress_cb=None) -> SimResult:
     dies = build_source_array(params["source"])
+    target_z = float(params.get("target_z", 80.0))
+    fov_cx = float(params.get("fov_cx", 0.0))
+    fov_cy = float(params.get("fov_cy", 0.0))
+    # Stash FOV / throw on a copy of mla so build_surfaces can aim channels
+    mla = dict(params.get("mla") or {})
+    mla["_target_z"] = target_z
+    mla["_fov_cx"] = fov_cx
+    mla["_fov_cy"] = fov_cy
+    if bool(mla.get("enabled", False)) and bool(mla.get("aim_to_fov", True)):
+        from mla_geometry import apply_mla_die_aim, lenslet_semi_aperture, scale_element_to_lenslet, thin_lens_focal_length_mm
+
+        e0 = next((e for e in params.get("elements", []) if e.get("enabled", True)), None)
+        if e0 is not None:
+            ap = lenslet_semi_aperture(mla, dies, params.get("source"))
+            g = scale_element_to_lenslet(e0, ap, scale_geometry=bool(mla.get("scale_to_pitch", True)))
+            mat = material_id_from_name(str(e0.get("material", "ACRYLIC_PMMA")))
+            n_g = refractive_index(mat, VISIBLE_NM_DEFAULT, float(params.get("custom_n", 1.5)))
+            f_mm = thin_lens_focal_length_mm(g["R1"], g["R2"], n_g, g["thickness"])
+            apply_mla_die_aim(dies, {**params, "mla": mla}, focal_length=f_mm, aperture=g["aperture"])
     surfaces = build_surfaces(
         params["elements"],
         float(params.get("lens_z_start", 3.0)),
-        mla=params.get("mla"),
+        mla=mla,
         dies=dies,
     )
-    target_z = float(params.get("target_z", 80.0))
     half_w = float(params.get("map_half_w", 50.0))
     half_h = float(params.get("map_half_h", 40.0))
     res = int(params.get("map_res", 96))
@@ -1071,8 +1217,6 @@ def run_simulation(params: Dict[str, Any], progress_cb=None) -> SimResult:
     kill_backward = bool(params.get("kill_backward", True))
     fov_w = float(params.get("fov_width", 40.0))
     fov_h = float(params.get("fov_height", 32.0))
-    fov_cx = float(params.get("fov_cx", 0.0))
-    fov_cy = float(params.get("fov_cy", 0.0))
     use_warp = bool(params.get("use_warp", True))
 
     active = [d for d in dies if d.enabled and d.flux > 0]
@@ -1244,6 +1388,44 @@ def _empty_stats() -> Dict[str, Any]:
     }
 
 
+MAX_ELEMENTS = 5
+
+
+def blank_element(
+    *,
+    enabled: bool = False,
+    material: str = "N_BK7",
+    shape_id: str = "custom",
+) -> Dict[str, Any]:
+    """Default unused lens-stack slot (disabled)."""
+    return {
+        "enabled": bool(enabled),
+        "R1": 30.0,
+        "R2": -30.0,
+        "thickness": 3.0,
+        "air_after": 2.0,
+        "aperture": 12.0,
+        "material": material,
+        "shape_id": shape_id,
+        "surface_mode": "rotational",
+        "k1": 0.0,
+        "k2": 0.0,
+        "A4_1": 0.0,
+        "A4_2": 0.0,
+        "R1y": None,
+        "R2y": None,
+        "aperture_y": None,
+    }
+
+
+def pad_elements(elements: List[Dict[str, Any]], n: int = MAX_ELEMENTS) -> List[Dict[str, Any]]:
+    """Ensure the stack has exactly ``n`` element slots."""
+    out = [dict(e) for e in (elements or [])]
+    while len(out) < n:
+        out.append(blank_element())
+    return out[:n]
+
+
 def default_params() -> Dict[str, Any]:
     return {
         "source": {
@@ -1287,42 +1469,10 @@ def default_params() -> Dict[str, Any]:
                 "R2y": None,
                 "aperture_y": None,
             },
-            {
-                "enabled": False,
-                "R1": 30.0,
-                "R2": -30.0,
-                "thickness": 3.0,
-                "air_after": 2.0,
-                "aperture": 12.0,
-                "material": "N_BK7",
-                "shape_id": "custom",
-                "surface_mode": "rotational",
-                "k1": 0.0,
-                "k2": 0.0,
-                "A4_1": 0.0,
-                "A4_2": 0.0,
-                "R1y": None,
-                "R2y": None,
-                "aperture_y": None,
-            },
-            {
-                "enabled": False,
-                "R1": 40.0,
-                "R2": -25.0,
-                "thickness": 3.0,
-                "air_after": 1.0,
-                "aperture": 11.0,
-                "material": "FORMLABS_CLEAR",
-                "shape_id": "custom",
-                "surface_mode": "rotational",
-                "k1": 0.0,
-                "k2": 0.0,
-                "A4_1": 0.0,
-                "A4_2": 0.0,
-                "R1y": None,
-                "R2y": None,
-                "aperture_y": None,
-            },
+            blank_element(material="N_BK7"),
+            blank_element(material="FORMLABS_CLEAR"),
+            blank_element(material="ACRYLIC_PMMA"),
+            blank_element(material="N_BK7"),
         ],
         "lens_z_start": 3.0,
         "custom_n": 1.5,
@@ -1347,5 +1497,7 @@ def default_params() -> Dict[str, Any]:
             "lenslet_aperture": 0.0,  # 0 = auto from COB pitch
             "export_plate": True,
             "scale_to_pitch": True,  # scale Element 1 R/t to die size (real micro-lenses)
+            "aim_to_fov": True,  # each channel steers toward FOV center
+            "aim_strength": 1.0,  # 0 = none, 1 = full geometric aim
         },
     }

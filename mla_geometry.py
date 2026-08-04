@@ -6,6 +6,7 @@ Ensures ray-tracer, side view, and CAD export use the same lenslet design:
   - Clear aperture from pitch × fill (or manual)
   - Optional proportional scaling of R / thickness / A4 so Element 1's form
     remains a proper lens when reduced to die pitch (not a flat cylinder)
+  - Optional per-channel aim so each die steers toward a common FOV center
 """
 from __future__ import annotations
 
@@ -45,6 +46,135 @@ def lenslet_semi_aperture(mla: Dict[str, Any], dies: list, src: Optional[Dict] =
     else:
         pitch = 1.6
     return max(0.1, 0.5 * pitch * fill)
+
+
+def thin_lens_focal_length_mm(
+    R1: float,
+    R2: float,
+    n: float,
+    thickness: float = 0.0,
+) -> float:
+    """
+    Thin-lensmaker focal length (mm). Sign convention matches OptiFlux:
+    R1 > 0 convex toward −Z (source), R2 < 0 for a biconvex rear.
+    """
+    n = max(float(n), 1.01)
+    c1 = 0.0 if abs(R1) < 1e-12 else 1.0 / float(R1)
+    c2 = 0.0 if abs(R2) < 1e-12 else 1.0 / float(R2)
+    # Standard lensmaker with our R2 sign: 1/f = (n-1)(c1 - c2 + …)
+    inv = (n - 1.0) * (c1 - c2)
+    t = max(float(thickness), 0.0)
+    if t > 1e-9 and abs(c1) > 1e-14 and abs(c2) > 1e-14:
+        inv += (n - 1.0) * (n - 1.0) * t * c1 * c2 / n
+    if abs(inv) < 1e-12:
+        return 1.0e6
+    return 1.0 / inv
+
+
+def channel_aim_to_fov(
+    die_cx: float,
+    die_cy: float,
+    die_cz: float,
+    *,
+    lens_z: float,
+    target_z: float,
+    fov_cx: float = 0.0,
+    fov_cy: float = 0.0,
+    focal_length: float,
+    aperture: float,
+    pitch: float,
+    aim_strength: float = 1.0,
+    base_tilt_x_deg: float = 0.0,
+    base_tilt_y_deg: float = 0.0,
+) -> Tuple[float, float, float, float]:
+    """
+    Aim one MLA channel at the FOV center on the target plane.
+
+    Returns
+    -------
+    lens_x0, lens_y0, tilt_x_deg, tilt_y_deg
+
+    - **Emission tilt**: die surface normal points at FOV center (plus any
+      global base tilt from the source panel).
+    - **Lens optical-center offset**: thin-lens decenter so a near-focus source
+      produces a collimated beam toward the FOV center. Offset is clamped so the
+      clear aperture stays inside the die pitch cell (no neighbor interference).
+    """
+    strength = min(1.5, max(0.0, float(aim_strength)))
+    Z = max(float(target_z) - float(lens_z), 1.0)
+    f = float(focal_length)
+    if not math.isfinite(f) or abs(f) < 1e-6:
+        f = 1.0e6
+    # Desired chief-ray angle from lens plane to FOV center (rad)
+    thx = math.atan2(float(fov_cx) - float(die_cx), Z)
+    thy = math.atan2(float(fov_cy) - float(die_cy), Z)
+    # Mild emission tilt only — strong tilt walks the Lambertian lobe off the
+    # small lenslet. Most steering is from optical-center offset.
+    tilt_frac = 0.30
+    tilt_y = base_tilt_y_deg + strength * tilt_frac * math.degrees(thx)  # +tilt_y → +X
+    tilt_x = base_tilt_x_deg + strength * tilt_frac * math.degrees(thy)  # +tilt_x → +Y
+    # Optical-center shift: (die - lens_center)/f ≈ θ_out → lens_center = die - f·θ
+    dx = -strength * f * thx
+    dy = -strength * f * thy
+    # Keep lenslet inside pitch cell: |offset| + aperture ≤ pitch/2
+    pitch = max(float(pitch), 2.0 * float(aperture) + 0.05)
+    max_off = max(0.0, 0.5 * pitch - float(aperture) - 0.02)
+    r_off = math.hypot(dx, dy)
+    if r_off > max_off and r_off > 1e-12:
+        s = max_off / r_off
+        dx *= s
+        dy *= s
+    return float(die_cx) + dx, float(die_cy) + dy, float(tilt_x), float(tilt_y)
+
+
+def apply_mla_die_aim(
+    dies: list,
+    params: Dict[str, Any],
+    *,
+    focal_length: Optional[float] = None,
+    aperture: Optional[float] = None,
+) -> Dict[int, Tuple[float, float]]:
+    """
+    Mutate each die's tilt_x_deg / tilt_y_deg to aim at FOV center when MLA aim
+    is enabled. Returns map of die index → (lens_x0, lens_y0) for surface build.
+    """
+    mla = params.get("mla") or {}
+    if not bool(mla.get("enabled", False)) or not bool(mla.get("aim_to_fov", True)):
+        return {i: (float(d.cx), float(d.cy)) for i, d in enumerate(dies)}
+
+    src = params.get("source") or {}
+    base_tx = float(src.get("tilt_x", 0.0))
+    base_ty = float(src.get("tilt_y", 0.0))
+    lens_z = float(params.get("lens_z_start", 3.0))
+    target_z = float(params.get("target_z", 80.0))
+    fov_cx = float(params.get("fov_cx", 0.0))
+    fov_cy = float(params.get("fov_cy", 0.0))
+    strength = float(mla.get("aim_strength", 1.0))
+    pitch = die_pitch_mm(dies) if dies else 1.6
+    ap = float(aperture) if aperture is not None else lenslet_semi_aperture(mla, dies, src)
+    f = float(focal_length) if focal_length is not None else max(ap * 2.5, 0.8)
+
+    centers: Dict[int, Tuple[float, float]] = {}
+    for i, d in enumerate(dies):
+        x0, y0, tx, ty = channel_aim_to_fov(
+            d.cx,
+            d.cy,
+            d.cz,
+            lens_z=lens_z,
+            target_z=target_z,
+            fov_cx=fov_cx,
+            fov_cy=fov_cy,
+            focal_length=f,
+            aperture=ap,
+            pitch=pitch,
+            aim_strength=strength,
+            base_tilt_x_deg=base_tx,
+            base_tilt_y_deg=base_ty,
+        )
+        d.tilt_x_deg = tx
+        d.tilt_y_deg = ty
+        centers[i] = (x0, y0)
+    return centers
 
 
 def scale_element_to_lenslet(
@@ -182,6 +312,7 @@ def build_mla_lens_specs(
 
     # Ensure positive edge thickness at aperture for this scaled geometry
     from engine import OpticalSurface, max_aperture_positive_edge
+    from materials_catalog import refractive_index, material_id_from_name, VISIBLE_NM_DEFAULT
 
     s1 = OpticalSurface(
         z_vertex=z0,
@@ -204,8 +335,35 @@ def build_mla_lens_specs(
     ap_ok = max_aperture_positive_edge(s1, s2, g["aperture"], min_edge=0.08)
     g["aperture"] = max(ap_ok, 0.08)
 
+    mat = material_id_from_name(str(e0.get("material", "ACRYLIC_PMMA")))
+    wl = float(src.get("wavelength_nm", VISIBLE_NM_DEFAULT))
+    n = refractive_index(mat, wl, float(params.get("custom_n", 1.5)))
+    f_mm = thin_lens_focal_length_mm(g["R1"], g["R2"], n, g["thickness"])
+    aim_on = bool(mla.get("aim_to_fov", True))
+    pitch = die_pitch_mm(dies) if len(dies) >= 2 else max(2.0 * g["aperture"], 1.6)
+    target_z = float(params.get("target_z", 80.0))
+    fov_cx = float(params.get("fov_cx", 0.0))
+    fov_cy = float(params.get("fov_cy", 0.0))
+    strength = float(mla.get("aim_strength", 1.0)) if aim_on else 0.0
+
     specs: List[LensSpec] = []
     for d in dies:
+        if aim_on and strength > 0:
+            x0, y0, _tx, _ty = channel_aim_to_fov(
+                float(d.cx),
+                float(d.cy),
+                float(getattr(d, "cz", 0.0)),
+                lens_z=z0,
+                target_z=target_z,
+                fov_cx=fov_cx,
+                fov_cy=fov_cy,
+                focal_length=f_mm,
+                aperture=g["aperture"],
+                pitch=pitch,
+                aim_strength=strength,
+            )
+        else:
+            x0, y0 = float(d.cx), float(d.cy)
         specs.append(
             LensSpec(
                 R1=g["R1"],
@@ -216,8 +374,8 @@ def build_mla_lens_specs(
                 k2=g["k2"],
                 A4_1=g["A4_1"],
                 A4_2=g["A4_2"],
-                x0=float(d.cx),
-                y0=float(d.cy),
+                x0=x0,
+                y0=y0,
                 z_front=z0,
                 R1y=g["R1y"],
                 R2y=g["R2y"],
@@ -233,6 +391,8 @@ def build_mla_lens_specs(
         "R2": g["R2"],
         "z_front": z0,
         "n_lenslets": len(specs),
+        "focal_length": f_mm,
+        "aim_to_fov": aim_on,
     }
     return specs, meta
 

@@ -1,0 +1,284 @@
+OptiFlux — Help and Definitions
+================================
+
+OptiFlux is a desktop Monte Carlo ray-tracing tool for designing LED and
+COB (Chip-on-Board) illumination lenses. Units are millimetres (mm) unless
+noted. The optical axis is +Z (light travels from source toward the target).
+
+
+--------------------------------------------------------------------------
+HEADER CONTROLS
+--------------------------------------------------------------------------
+
+Trace rays
+  Run (or re-run) the ray-trace simulation with the current parameters.
+
+Optimize FOV
+  Search lens parameters to increase power inside the rectangular Field of
+  View (FOV). Uses a derivative-free optimizer (differential evolution).
+
+Auto-run
+  When checked, parameter changes schedule a new trace after a short delay.
+
+Export STL / Export STEP
+  Write CAD files of the current lens surfaces for 3D printing or machining.
+  Coordinates are in millimetres.
+
+Reset defaults
+  Restore factory starting parameters and re-trace.
+
+Presets
+  Quick starting points (single LED, COB arrays, rectangular FOV designs).
+
+Help
+  Opens this document in a scrollable window.
+
+
+--------------------------------------------------------------------------
+SOURCE (LED / COB)
+--------------------------------------------------------------------------
+
+Mode — single vs cob
+  Single: one rectangular emitter die.
+  COB: a grid of dies (rows × cols) at a pitch.
+
+Pitch X / Pitch Y
+  Centre-to-centre spacing of dies in a COB array (mm).
+
+Die width / Die height
+  Physical size of each emitting rectangle (mm).
+
+Source Z
+  Axial position of the emitter plane (mm). Usually 0.
+
+Half-angle
+  Lambertian-like emission cone half-angle (degrees). Larger values mean
+  wider spread before the lens.
+
+Wavelength
+  Design wavelength in nanometres (nm). Used for refractive index lookup.
+
+Tilt X / Tilt Y
+  Global tip of all die normals (degrees). Positive tilt tips the local +Z
+  toward +Y (tilt X) or +X (tilt Y).
+
+MLA (micro-lens array)
+  When enabled, Element 1 is replicated once per COB die as a lenslet.
+  Fill factor and pitch limit each lenslet aperture so neighbours do not
+  interfere. Optional aim steers each channel toward the FOV centre.
+
+
+--------------------------------------------------------------------------
+OPTICS (LENS STACK)
+--------------------------------------------------------------------------
+
+Element 1 … Element 5
+  Up to five sequential lenses along +Z. Disabled elements are ignored.
+  Use collapse controls to hide unused slots.
+
+Enabled
+  Include this element in the ray-trace and CAD export.
+
+Lens type
+  Library starting shapes (plano-convex, biconvex, …) that set R1/R2 signs
+  and proportions. Custom leaves radii fully free.
+
+|R| magnitude
+  Scales library-type radii while preserving the shape family.
+
+Material
+  Glass or plastic from the catalog (PMMA, N-BK7, Formlabs Clear, …).
+  Index n is taken at the source wavelength.
+
+Surface mode
+  rotational — same power in X and Y (circular beam tendency).
+  biconic — independent Rx and Ry (rectangular footprints).
+  cylinder_x — power only in X (plano in Y).
+  cylinder_y — power only in Y (plano in X).
+
+R1 / Rx front, R2 / Rx rear
+  Vertex radii of curvature (mm). Sign convention: positive R1 is convex
+  toward the source (−Z side of the front surface). R2 negative is typical
+  for a biconvex rear.
+
+R1y / R2y
+  Y-meridian radii for biconic or cylinder_y surfaces.
+
+Thickness
+  Centre thickness of the lens (mm).
+
+Air gap after
+  Air space after this element before the next (mm).
+
+Semi-aperture X / Y
+  Clear semi-diameter (mm). Elliptical aperture uses both X and Y.
+
+Conic k, Asphere A4
+  Standard even asphere terms on each surface.
+
+Lens Z start
+  Z position of the first surface vertex of Element 1 (mm).
+
+
+--------------------------------------------------------------------------
+TARGET AND FIELD OF VIEW (FOV)
+--------------------------------------------------------------------------
+
+Target Z
+  Distance from Z = 0 to the irradiance plane (mm).
+
+FOV width / FOV height
+  Rectangular region of interest on the target plane (mm). This is the
+  “camera field” or illumination zone you want to fill.
+
+FOV aspect W/H
+  Width divided by height. Lock aspect updates height when width changes.
+
+FOV center X / Y
+  Centre of the rectangular FOV on the target plane (mm).
+
+Map half-width / half-height
+  Extent of the recorded irradiance map (mm). Should be larger than the FOV.
+
+Map resolution
+  Number of bins across the map width (higher = smoother, slower).
+
+Design optics for rectangular FOV
+  Seeds cylindrical or biconic powers estimated for the current FOV aspect.
+
+Swap anamorphic X ↔ Y
+  Exchanges cylinder/biconic X and Y powers (fixes a 90° rotated footprint
+  without changing the FOV size).
+
+Rotate optics 90° vs FOV
+  Swaps FOV width with height AND swaps anamorphic X/Y powers so the design
+  tracks a 90° rotation of the rectangular target relative to the lenses.
+
+
+--------------------------------------------------------------------------
+SIMULATION
+--------------------------------------------------------------------------
+
+Rays to trace
+  Monte Carlo sample count for the irradiance map.
+
+Side-view ray paths
+  How many individual ray polylines to store for the side view and for
+  optional ray-class overlays. Raising this value draws more rays and
+  more colored endpoints on the target plane.
+
+Color partial lens rays (target)
+  When checked, both the target plane and the side view color rays by class:
+    • Cyan — rays that missed all lenses
+    • Amber — rays that went through some but not all enabled elements
+    • Green — rays that interacted with every enabled element in the stack
+  Off by default. Raise “Side-view ray paths” for denser overlays.
+
+
+--------------------------------------------------------------------------
+OPTIMIZER
+--------------------------------------------------------------------------
+
+Two-phase rectangular
+  Phase 1 improves flux/uniformity on the current stack. Phase 2 can add
+  one or two anamorphic elements to match FOV aspect, then keeps phase 1 if
+  the extras do not improve FOV flux.
+
+Extra anamorphic lenses
+  0 = none; 1 = biconic singlet; 2 = crossed cylinders (X then Y).
+
+Aspect-match / fill / uniformity weights
+  How strongly the score penalizes wrong footprint aspect, under-sized
+  illumination, or non-uniform FOV irradiance.
+
+Rays per evaluation / Max evaluations
+  Coarser and fewer for speed; higher for a more stable final design.
+
+
+--------------------------------------------------------------------------
+METRICS (READOUTS)
+--------------------------------------------------------------------------
+
+Collection efficiency
+  Power that reaches the map (any location) divided by source power.
+
+FOV flux (fraction)
+  Power inside the rectangular FOV divided by source power.
+
+Uniformity
+  1 − coefficient of variation of irradiance inside the FOV (higher is more
+  even). Alternate definitions may use min/max.
+
+Footprint aspect σx/σy
+  Power-weighted second-moment width ratio of the illuminated pattern.
+
+Target FOV aspect W/H
+  FOV width / FOV height.
+
+Aspect error
+  Relative mismatch between footprint aspect and FOV aspect.
+
+Coverage
+  Fraction of FOV bins that are meaningfully lit.
+
+EFL (element 1)
+  Approximate thin-lens effective focal length from the lensmaker formula.
+
+
+--------------------------------------------------------------------------
+VIEWS
+--------------------------------------------------------------------------
+
+Side view (Y–Z)
+  Cross-section along the optical axis. Scroll to zoom; right-drag to pan;
+  left-drag the centre handle (yellow square) to move a lens along Z;
+  left-drag the top or bottom diamond grips to change clear semi-aperture.
+  Release the mouse to re-trace.
+
+Target plane (X–Y)
+  Irradiance map at Target Z. Purple rectangle = FOV. White cross = power
+  centroid. Scroll / right-drag as in the side view.
+
+Profiles panel (left of target plane)
+  Always-visible line cuts along X (Y=0), Y (X=0), and the XY diagonal, with
+  FOV boundary markers. The optimizer uses profile-fill from these cuts.
+
+Buy list
+  Commercial-style lens parameters (diameters, radii, thickness, material,
+  estimated EFL) for quoting from catalog suppliers.
+
+
+--------------------------------------------------------------------------
+PHYSICS NOTES
+--------------------------------------------------------------------------
+
+Monte Carlo
+  Random rays are sampled from each die; statistics converge as ray count
+  increases. Results are noisy at low ray counts.
+
+Snell + Fresnel
+  Refraction uses Snell’s law; transmission is reduced by Fresnel reflection
+  at each interface when Fresnel is enabled.
+
+TIR (total internal reflection)
+  When a ray cannot refract out of glass, it is absorbed by default (or
+  reflected if bounce mode is enabled).
+
+MLA aim
+  Per-die emission tilt and optical-center offset toward the FOV centre,
+  clamped so lenslets stay inside their pitch cells.
+
+
+--------------------------------------------------------------------------
+TIPS
+--------------------------------------------------------------------------
+
+• Start with one element, Trace, then enable more elements only if needed.
+• For rectangular FOV, try “Crossed cylinders” or “Biconic singlet”, then
+  Optimize FOV with a modest evaluation budget.
+• If the footprint looks 90° rotated, use Swap anamorphic X↔Y or Rotate
+  optics 90° vs FOV.
+• Increase rays (15k–50k) before trusting uniformity numbers.
+• Collapse disabled elements to keep the side panel short.
+
+End of help file.

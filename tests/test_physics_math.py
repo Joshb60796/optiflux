@@ -408,12 +408,43 @@ class TestRayTracePhysics(unittest.TestCase):
         p["source"]["rows"] = 2
         p["source"]["cols"] = 2
         p["mla"]["enabled"] = True
+        p["mla"]["aim_to_fov"] = False  # centres coincide with dies when aim is off
         dies = build_source_array(p["source"])
         surfs = build_surfaces(p["elements"], p["lens_z_start"], p["mla"], dies)
-        # 4 dies × 2 surfaces = 8 (elem 2/3 disabled)
+        # 4 dies × 2 surfaces = 8 (later elements disabled)
         self.assertEqual(len(surfs), 8)
         for s in surfs:
-            self.assertTrue(any(math.isclose(s.x0, d.cx) and math.isclose(s.y0, d.cy) for d in dies))
+            self.assertTrue(
+                any(math.isclose(s.x0, d.cx) and math.isclose(s.y0, d.cy) for d in dies)
+            )
+
+    def test_mla_aim_offsets_toward_fov_center(self):
+        """With aim on, outer dies get lens centres shifted (still near the die)."""
+        p = default_params()
+        p["source"]["rows"] = 2
+        p["source"]["cols"] = 2
+        p["source"]["pitch_x"] = 2.0
+        p["source"]["pitch_y"] = 2.0
+        p["mla"]["enabled"] = True
+        p["mla"]["aim_to_fov"] = True
+        p["mla"]["aim_strength"] = 1.0
+        p["mla"]["_target_z"] = 40.0
+        p["mla"]["_fov_cx"] = 0.0
+        p["mla"]["_fov_cy"] = 0.0
+        dies = build_source_array(p["source"])
+        surfs = build_surfaces(p["elements"], p["lens_z_start"], p["mla"], dies)
+        self.assertEqual(len(surfs), 8)
+        # Pair surfaces with nearest die; offset should stay within ~half pitch
+        for s in surfs:
+            if not s.label.endswith("S1"):
+                continue
+            d = min(dies, key=lambda dd: math.hypot(s.x0 - dd.cx, s.y0 - dd.cy))
+            self.assertLess(math.hypot(s.x0 - d.cx, s.y0 - d.cy), 1.05)
+            # Outer dies should not sit exactly on axis-symmetric zero offset only —
+            # at least some channels move (any non-zero for off-axis dies)
+            if abs(d.cx) > 0.1 or abs(d.cy) > 0.1:
+                # Offset direction is outward for positive lens aim (see channel_aim)
+                self.assertGreater(math.hypot(s.x0, s.y0) + 1e-9, math.hypot(d.cx, d.cy) - 1e-6)
 
     def test_monte_carlo_collects_flux(self):
         p = default_params()

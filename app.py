@@ -13,6 +13,7 @@ import copy
 import math
 import threading
 import tkinter as tk
+from pathlib import Path
 from tkinter import ttk, messagebox, filedialog
 from typing import Any, Dict, Optional
 
@@ -23,7 +24,10 @@ from matplotlib.colors import LinearSegmentedColormap
 
 from engine import (
     MATERIAL_NAMES,
+    MAX_ELEMENTS,
+    blank_element,
     default_params,
+    pad_elements,
     run_simulation,
     SimResult,
 )
@@ -47,6 +51,7 @@ from rect_fov import (
     design_biconic_singlet_for_rect_fov,
     design_crossed_cylinders_for_rect_fov,
     fov_aspect,
+    swap_anamorphic_xy_params,
     set_fov_from_aspect,
 )
 from optimizer import OptimizeConfig, optimize_fov_flux
@@ -382,41 +387,11 @@ class OptiFluxApp(tk.Tk):
         self.v_export_plate = tk.BooleanVar(value=self.params.get("mla", {}).get("export_plate", True))
         self.v_mesh_res = tk.IntVar(value=48)
 
+        self.params["elements"] = pad_elements(self.params.get("elements") or [], MAX_ELEMENTS)
         self.elem_vars = []
+        self.elem_ui = []  # collapsible panel state per element
         for e in self.params["elements"]:
-            r1y = e.get("R1y")
-            r2y = e.get("R2y")
-            apy = e.get("aperture_y")
-            sid = e.get("shape_id", "custom")
-            r_mag = max(abs(float(e.get("R1", 25))), abs(float(e.get("R2", 25))), 2.0)
-            if r_mag < 1e-6:
-                r_mag = 25.0
-            self.elem_vars.append(
-                {
-                    "enabled": tk.BooleanVar(value=e["enabled"]),
-                    "shape": tk.StringVar(value=shape_label_from_id(sid)),
-                    "R_mag": tk.DoubleVar(value=r_mag),
-                    "R1": tk.DoubleVar(value=e["R1"]),
-                    "R2": tk.DoubleVar(value=e["R2"]),
-                    "R1y": tk.DoubleVar(value=float(r1y) if r1y is not None else e["R1"]),
-                    "R2y": tk.DoubleVar(value=float(r2y) if r2y is not None else e["R2"]),
-                    "thickness": tk.DoubleVar(value=e["thickness"]),
-                    "air_after": tk.DoubleVar(value=e["air_after"]),
-                    "aperture": tk.DoubleVar(value=e["aperture"]),
-                    "aperture_y": tk.DoubleVar(value=float(apy) if apy is not None else e["aperture"]),
-                    "material": tk.StringVar(value=material_name_from_id(e["material"])),
-                    "surface_mode": tk.StringVar(value=e.get("surface_mode", "rotational")),
-                    "k1": tk.DoubleVar(value=e["k1"]),
-                    "k2": tk.DoubleVar(value=e["k2"]),
-                    "A4_1": tk.DoubleVar(value=e["A4_1"]),
-                    "A4_2": tk.DoubleVar(value=e["A4_2"]),
-                    "use_elliptical_ap": tk.BooleanVar(value=apy is not None),
-                    "use_biconic_radii": tk.BooleanVar(
-                        value=e.get("surface_mode", "rotational") != "rotational"
-                        or r1y is not None
-                    ),
-                }
-            )
+            self.elem_vars.append(self._make_elem_vars(e))
 
         self.v_target_z = tk.DoubleVar(value=self.params["target_z"])
         self.v_fov_w = tk.DoubleVar(value=self.params["fov_width"])
@@ -462,6 +437,10 @@ class OptiFluxApp(tk.Tk):
             side="right", padx=4
         )
         ttk.Button(header, text="Reset defaults", command=self.reset_defaults).pack(side="right", padx=4)
+        ttk.Button(header, text="Buy list…", command=self._show_buy_list_window).pack(
+            side="right", padx=4
+        )
+        ttk.Button(header, text="Help", command=self._show_help).pack(side="right", padx=4)
 
         self.preset = tk.StringVar(value="")
         preset_cb = self._make_combobox(
@@ -567,7 +546,7 @@ class OptiFluxApp(tk.Tk):
         side_tools.pack(side="top", fill="x", padx=8)
         ttk.Label(
             side_tools,
-            text="Side: scroll=zoom · right-drag=pan · left-drag lens · double-click=reset",
+            text="Side: scroll=zoom · right-drag=pan · left-drag move · top/bottom drag size · double-click=reset",
             style="Dim.TLabel",
         ).pack(side="left")
         ttk.Button(side_tools, text="Reset side zoom", command=self._reset_side_zoom).pack(
@@ -599,9 +578,22 @@ class OptiFluxApp(tk.Tk):
             style="Dim.TLabel",
         ).pack(side="right", padx=8)
 
-        self.fig_tgt = Figure(figsize=(6, 3.2), dpi=100, facecolor=BG)
+        # Bottom plots: profiles (left) | target plane (right)
+        bot_plots = tk.Frame(bot, bg=BG)
+        bot_plots.pack(side="top", fill="both", expand=True)
+
+        prof_frame = tk.Frame(bot_plots, bg=BG)
+        prof_frame.pack(side="left", fill="both", expand=True)
+        self.fig_prof = Figure(figsize=(4.2, 3.2), dpi=100, facecolor=BG)
+        self.ax_prof = self.fig_prof.add_subplot(111)
+        self.canvas_prof = FigureCanvasTkAgg(self.fig_prof, master=prof_frame)
+        self.canvas_prof.get_tk_widget().pack(side="top", fill="both", expand=True, padx=2, pady=2)
+
+        tgt_frame = tk.Frame(bot_plots, bg=BG)
+        tgt_frame.pack(side="left", fill="both", expand=True)
+        self.fig_tgt = Figure(figsize=(5.0, 3.2), dpi=100, facecolor=BG)
         self.ax_tgt = self.fig_tgt.add_subplot(111)
-        self.canvas_tgt = FigureCanvasTkAgg(self.fig_tgt, master=bot)
+        self.canvas_tgt = FigureCanvasTkAgg(self.fig_tgt, master=tgt_frame)
         tgt_widget = self.canvas_tgt.get_tk_widget()
         tgt_widget.pack(side="top", fill="both", expand=True, padx=2, pady=2)
         self._connect_target_mouse()
@@ -614,6 +606,191 @@ class OptiFluxApp(tk.Tk):
 
         self._style_axes()
         self._redraw_empty()
+
+    def _make_elem_vars(self, e: dict) -> dict:
+        r1y = e.get("R1y")
+        r2y = e.get("R2y")
+        apy = e.get("aperture_y")
+        sid = e.get("shape_id", "custom")
+        r_mag = max(abs(float(e.get("R1", 25))), abs(float(e.get("R2", 25))), 2.0)
+        if r_mag < 1e-6:
+            r_mag = 25.0
+        return {
+            "enabled": tk.BooleanVar(value=bool(e.get("enabled", False))),
+            "shape": tk.StringVar(value=shape_label_from_id(sid)),
+            "R_mag": tk.DoubleVar(value=r_mag),
+            "R1": tk.DoubleVar(value=float(e.get("R1", 30.0))),
+            "R2": tk.DoubleVar(value=float(e.get("R2", -30.0))),
+            "R1y": tk.DoubleVar(
+                value=float(r1y) if r1y is not None else float(e.get("R1", 30.0))
+            ),
+            "R2y": tk.DoubleVar(
+                value=float(r2y) if r2y is not None else float(e.get("R2", -30.0))
+            ),
+            "thickness": tk.DoubleVar(value=float(e.get("thickness", 3.0))),
+            "air_after": tk.DoubleVar(value=float(e.get("air_after", 2.0))),
+            "aperture": tk.DoubleVar(value=float(e.get("aperture", 12.0))),
+            "aperture_y": tk.DoubleVar(
+                value=float(apy) if apy is not None else float(e.get("aperture", 12.0))
+            ),
+            "material": tk.StringVar(
+                value=material_name_from_id(str(e.get("material", "N_BK7")))
+            ),
+            "surface_mode": tk.StringVar(value=e.get("surface_mode", "rotational")),
+            "k1": tk.DoubleVar(value=float(e.get("k1", 0.0))),
+            "k2": tk.DoubleVar(value=float(e.get("k2", 0.0))),
+            "A4_1": tk.DoubleVar(value=float(e.get("A4_1", 0.0))),
+            "A4_2": tk.DoubleVar(value=float(e.get("A4_2", 0.0))),
+            "use_elliptical_ap": tk.BooleanVar(value=apy is not None),
+            "use_biconic_radii": tk.BooleanVar(
+                value=e.get("surface_mode", "rotational") != "rotational" or r1y is not None
+            ),
+        }
+
+    def _element_header_text(self, i: int, ev: dict) -> str:
+        on = bool(ev["enabled"].get())
+        mode = str(ev["surface_mode"].get())
+        if on:
+            return (
+                f"Element {i + 1}  ·  ON  ·  {mode}  ·  "
+                f"R1={float(ev['R1'].get()):.1f}  t={float(ev['thickness'].get()):.1f}"
+            )
+        return f"Element {i + 1}  ·  off  ·  click ▶ to expand"
+
+    def _set_element_collapsed(self, i: int, collapsed: bool):
+        if i < 0 or i >= len(self.elem_ui):
+            return
+        ui = self.elem_ui[i]
+        ui["collapsed"] = bool(collapsed)
+        if collapsed:
+            ui["body"].pack_forget()
+            ui["toggle_btn"].configure(text="▶")
+        else:
+            ui["body"].pack(fill="x", padx=2, pady=(0, 4))
+            ui["toggle_btn"].configure(text="▼")
+        ui["title"].configure(text=self._element_header_text(i, self.elem_vars[i]))
+
+    def _toggle_element_collapsed(self, i: int):
+        if i < 0 or i >= len(self.elem_ui):
+            return
+        self._set_element_collapsed(i, not self.elem_ui[i]["collapsed"])
+
+    def _collapse_disabled_elements(self):
+        for i, ev in enumerate(self.elem_vars):
+            if not bool(ev["enabled"].get()):
+                self._set_element_collapsed(i, True)
+
+    def _expand_all_elements(self):
+        for i in range(len(self.elem_ui)):
+            self._set_element_collapsed(i, False)
+
+    def _on_element_enabled(self, i: int):
+        """Enable toggles: expand when turning on, collapse when turning off."""
+        if i < 0 or i >= len(self.elem_vars):
+            return
+        on = bool(self.elem_vars[i]["enabled"].get())
+        self._set_element_collapsed(i, collapsed=not on)
+        self._on_param_change()
+
+    def _build_element_panel(self, parent, i: int, ev: dict):
+        el = ttk.LabelFrame(parent, text="")
+        el.pack(fill="x", padx=6, pady=3)
+
+        header = ttk.Frame(el)
+        header.pack(fill="x", padx=2, pady=2)
+        toggle_btn = ttk.Button(
+            header,
+            text="▼",
+            width=3,
+            command=lambda idx=i: self._toggle_element_collapsed(idx),
+        )
+        toggle_btn.pack(side="left", padx=(2, 4))
+        title = ttk.Label(header, text=self._element_header_text(i, ev), style="Dim.TLabel")
+        title.pack(side="left", fill="x", expand=True)
+        ttk.Checkbutton(
+            header,
+            text="Enabled",
+            variable=ev["enabled"],
+            command=lambda idx=i: self._on_element_enabled(idx),
+        ).pack(side="right", padx=4)
+
+        body = ttk.Frame(el)
+        body.pack(fill="x", padx=2, pady=(0, 4))
+
+        ttk.Label(body, text="Lens type", style="Dim.TLabel").pack(anchor="w", padx=4, pady=(4, 0))
+        shape_cb = self._make_combobox(
+            body,
+            ev["shape"],
+            shape_dropdown_values(),
+            width=32,
+            command=lambda e, idx=i: self._on_element_shape_selected(idx),
+        )
+        shape_cb.pack(fill="x", padx=4, pady=2)
+
+        SliderRow(
+            body,
+            "|R| magnitude (mm) for type",
+            ev["R_mag"],
+            2,
+            200,
+            0.5,
+            command=lambda idx=i: self._on_element_r_mag(idx),
+        ).pack(fill="x", padx=8, pady=1)
+
+        ttk.Label(body, text="Material", style="Dim.TLabel").pack(anchor="w", padx=4, pady=(4, 0))
+        mat_cb = self._make_combobox(
+            body,
+            ev["material"],
+            MATERIAL_NAMES,
+            width=32,
+            command=lambda e: self._on_param_change(),
+        )
+        mat_cb.pack(fill="x", padx=4, pady=2)
+
+        ttk.Label(body, text="Surface mode", style="Dim.TLabel").pack(anchor="w", padx=4, pady=(4, 0))
+        mode_cb = self._make_combobox(
+            body,
+            ev["surface_mode"],
+            ["rotational", "biconic", "cylinder_x", "cylinder_y"],
+            width=32,
+            command=lambda e: self._on_param_change(),
+        )
+        mode_cb.pack(fill="x", padx=4, pady=2)
+
+        self._add_slider(body, "R₁ / Rₓ front (mm)", ev["R1"], -200, 200, 0.5)
+        self._add_slider(body, "R₂ / Rₓ rear (mm)", ev["R2"], -200, 200, 0.5)
+        self._add_slider(body, "R₁ᵧ front (mm) · biconic/cyl Y", ev["R1y"], -200, 200, 0.5)
+        self._add_slider(body, "R₂ᵧ rear (mm) · biconic/cyl Y", ev["R2y"], -200, 200, 0.5)
+        self._add_slider(body, "Thickness (mm)", ev["thickness"], 0.2, 30, 0.1)
+        self._add_slider(body, "Air gap after (mm)", ev["air_after"], 0, 50, 0.1)
+        self._add_slider(body, "Semi-aperture X (mm)", ev["aperture"], 1, 50, 0.1)
+        self._add_slider(body, "Semi-aperture Y (mm)", ev["aperture_y"], 1, 50, 0.1)
+        ttk.Checkbutton(
+            body,
+            text="Elliptical clear aperture (use X & Y)",
+            variable=ev["use_elliptical_ap"],
+            command=self._on_param_change,
+        ).pack(anchor="w", padx=4)
+        self._add_slider(body, "Conic k₁", ev["k1"], -5, 5, 0.01)
+        self._add_slider(body, "Conic k₂", ev["k2"], -5, 5, 0.01)
+        self._add_slider(body, "Asphere A4₁", ev["A4_1"], -0.001, 0.001, 1e-6)
+        self._add_slider(body, "Asphere A4₂", ev["A4_2"], -0.001, 0.001, 1e-6)
+
+        self.elem_ui.append(
+            {
+                "frame": el,
+                "header": header,
+                "body": body,
+                "title": title,
+                "toggle_btn": toggle_btn,
+                "collapsed": False,
+            }
+        )
+        # Start collapsed when disabled
+        if not bool(ev["enabled"].get()):
+            self._set_element_collapsed(i, True)
+        else:
+            self._set_element_collapsed(i, False)
 
     def _add_slider(self, parent, label, var, lo, hi, res=0.1, is_int=False):
         row = SliderRow(parent, label, var, lo, hi, res, is_int, command=self._on_param_change)
@@ -704,6 +881,30 @@ class OptiFluxApp(tk.Tk):
             variable=self.v_mla_scale,
             command=self._on_param_change,
         ).pack(anchor="w", padx=6)
+        self.v_mla_aim = tk.BooleanVar(
+            value=self.params.get("mla", {}).get("aim_to_fov", True)
+        )
+        self.v_mla_aim_s = tk.DoubleVar(
+            value=float(self.params.get("mla", {}).get("aim_strength", 1.0))
+        )
+        ttk.Checkbutton(
+            mla_box,
+            text="Aim each lenslet at FOV center (common spot)",
+            variable=self.v_mla_aim,
+            command=self._on_param_change,
+        ).pack(anchor="w", padx=6)
+        self._add_slider(
+            mla_box, "Aim strength (0=none, 1=full)", self.v_mla_aim_s, 0.0, 1.5, 0.05
+        )
+        ttk.Label(
+            mla_box,
+            text=(
+                "Per-die emission tilt + optical-center offset toward FOV "
+                "center; offset clamped so lenslets stay inside pitch cells."
+            ),
+            style="Dim.TLabel",
+            wraplength=300,
+        ).pack(anchor="w", padx=6, pady=2)
         self._add_slider(mla_box, "Fill factor (aperture / pitch)", self.v_mla_fill, 0.4, 0.99, 0.01)
         self._add_slider(mla_box, "Lenslet semi-aperture mm (0=auto)", self.v_mla_ap, 0, 10, 0.05)
         ttk.Checkbutton(
@@ -746,72 +947,24 @@ class OptiFluxApp(tk.Tk):
             command=self._on_param_change,
         ).pack(anchor="w", padx=8)
 
+        ttk.Label(
+            opt,
+            text=f"Up to {MAX_ELEMENTS} elements. Collapse unused slots to save space.",
+            style="Dim.TLabel",
+            wraplength=290,
+        ).pack(anchor="w", padx=8, pady=(2, 0))
+        btn_row = ttk.Frame(opt)
+        btn_row.pack(fill="x", padx=6, pady=2)
+        ttk.Button(
+            btn_row, text="Collapse disabled", command=self._collapse_disabled_elements
+        ).pack(side="left", padx=(0, 4))
+        ttk.Button(
+            btn_row, text="Expand all", command=self._expand_all_elements
+        ).pack(side="left")
+
+        self.elem_ui = []
         for i, ev in enumerate(self.elem_vars):
-            el = ttk.LabelFrame(opt, text=f"Element {i + 1}")
-            el.pack(fill="x", padx=6, pady=4)
-            ttk.Checkbutton(
-                el, text="Enabled", variable=ev["enabled"], command=self._on_param_change
-            ).pack(anchor="w", padx=4)
-
-            # Per-element lens type / material / mode (full-width for reliable clicks)
-            ttk.Label(el, text="Lens type", style="Dim.TLabel").pack(anchor="w", padx=4, pady=(4, 0))
-            shape_cb = self._make_combobox(
-                el,
-                ev["shape"],
-                shape_dropdown_values(),
-                width=32,
-                command=lambda e, idx=i: self._on_element_shape_selected(idx),
-            )
-            shape_cb.pack(fill="x", padx=4, pady=2)
-
-            SliderRow(
-                el,
-                "|R| magnitude (mm) for type",
-                ev["R_mag"],
-                2,
-                200,
-                0.5,
-                command=lambda idx=i: self._on_element_r_mag(idx),
-            ).pack(fill="x", padx=8, pady=1)
-
-            ttk.Label(el, text="Material", style="Dim.TLabel").pack(anchor="w", padx=4, pady=(4, 0))
-            mat_cb = self._make_combobox(
-                el,
-                ev["material"],
-                MATERIAL_NAMES,
-                width=32,
-                command=lambda e: self._on_param_change(),
-            )
-            mat_cb.pack(fill="x", padx=4, pady=2)
-
-            ttk.Label(el, text="Surface mode", style="Dim.TLabel").pack(anchor="w", padx=4, pady=(4, 0))
-            mode_cb = self._make_combobox(
-                el,
-                ev["surface_mode"],
-                ["rotational", "biconic", "cylinder_x", "cylinder_y"],
-                width=32,
-                command=lambda e: self._on_param_change(),
-            )
-            mode_cb.pack(fill="x", padx=4, pady=2)
-
-            self._add_slider(el, "R₁ / Rₓ front (mm)", ev["R1"], -200, 200, 0.5)
-            self._add_slider(el, "R₂ / Rₓ rear (mm)", ev["R2"], -200, 200, 0.5)
-            self._add_slider(el, "R₁ᵧ front (mm) · biconic/cyl Y", ev["R1y"], -200, 200, 0.5)
-            self._add_slider(el, "R₂ᵧ rear (mm) · biconic/cyl Y", ev["R2y"], -200, 200, 0.5)
-            self._add_slider(el, "Thickness (mm)", ev["thickness"], 0.2, 30, 0.1)
-            self._add_slider(el, "Air gap after (mm)", ev["air_after"], 0, 50, 0.1)
-            self._add_slider(el, "Semi-aperture X (mm)", ev["aperture"], 1, 50, 0.1)
-            self._add_slider(el, "Semi-aperture Y (mm)", ev["aperture_y"], 1, 50, 0.1)
-            ttk.Checkbutton(
-                el,
-                text="Elliptical clear aperture (use X & Y)",
-                variable=ev["use_elliptical_ap"],
-                command=self._on_param_change,
-            ).pack(anchor="w", padx=4)
-            self._add_slider(el, "Conic k₁", ev["k1"], -5, 5, 0.01)
-            self._add_slider(el, "Conic k₂", ev["k2"], -5, 5, 0.01)
-            self._add_slider(el, "Asphere A4₁", ev["A4_1"], -0.001, 0.001, 1e-6)
-            self._add_slider(el, "Asphere A4₂", ev["A4_2"], -0.001, 0.001, 1e-6)
+            self._build_element_panel(opt, i, ev)
 
         # Target — rectangular FOV (camera field)
         tgt = ttk.LabelFrame(parent, text="TARGET  ·  rectangular FOV (camera field)")
@@ -858,6 +1011,16 @@ class OptiFluxApp(tk.Tk):
             text="Biconic singlet (Rx ≠ Ry)",
             command=lambda: self._design_rect_fov("biconic"),
         ).pack(fill="x", padx=4, pady=2)
+        ttk.Button(
+            design,
+            text="Swap anamorphic X ↔ Y (fix 90° rotation)",
+            command=self._swap_anamorphic_xy,
+        ).pack(fill="x", padx=4, pady=2)
+        ttk.Button(
+            design,
+            text="Rotate optics 90° vs FOV (swap W↔H + axes)",
+            command=self._rotate_optics_90_vs_fov,
+        ).pack(fill="x", padx=4, pady=2)
         self.design_status = tk.StringVar(value="")
         ttk.Label(design, textvariable=self.design_status, style="Dim.TLabel", wraplength=280).pack(
             anchor="w", padx=4, pady=2
@@ -871,12 +1034,22 @@ class OptiFluxApp(tk.Tk):
         sim.pack(fill="x", padx=8, pady=6)
         self._add_slider(sim, "Rays to trace", self.v_rays, 500, 100000, 500, True)
         self._add_slider(sim, "Side-view ray paths", self.v_disp, 20, 5000, 10, True)
+        self.v_color_partial = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            sim,
+            text="Color partial-lens rays on target (off by default)",
+            variable=self.v_color_partial,
+            command=self._on_partial_ray_color_toggle,
+        ).pack(anchor="w", padx=8, pady=2)
         ttk.Label(
             sim,
-            text="More rays → cleaner flux map. Use 15k–30k for final uniformity.",
+            text=(
+                "When on: green = all elements, amber = some elements only, "
+                "cyan = missed all lenses. More rays → cleaner flux map."
+            ),
             style="Dim.TLabel",
             wraplength=290,
-        ).pack(anchor="w", padx=8, pady=4)
+        ).pack(anchor="w", padx=8, pady=2)
 
         # Optimizer — maximize power into the rectangular FOV
         optz = ttk.LabelFrame(parent, text="OPTIMIZER  ·  rectangular FOV flux")
@@ -1085,6 +1258,8 @@ class OptiFluxApp(tk.Tk):
             "lenslet_aperture": float(self.v_mla_ap.get()),
             "export_plate": bool(self.v_export_plate.get()),
             "scale_to_pitch": bool(self.v_mla_scale.get()) if hasattr(self, "v_mla_scale") else True,
+            "aim_to_fov": bool(self.v_mla_aim.get()) if hasattr(self, "v_mla_aim") else True,
+            "aim_strength": float(self.v_mla_aim_s.get()) if hasattr(self, "v_mla_aim_s") else 1.0,
         }
         p["target_z"] = float(self.v_target_z.get())
         p["fov_width"] = float(self.v_fov_w.get())
@@ -1149,12 +1324,14 @@ class OptiFluxApp(tk.Tk):
                 self.after(0, lambda r=result, b=bi, n=n_batches: self._on_batch(r, b, n, gen))
 
             try:
+                # Side-view / color-overlay path count follows the UI slider
+                n_disp = max(20, int(params.get("display_rays", self.prog_disp_batch)))
                 run_simulation_progressive(
                     params,
                     batch_cb=on_batch,
                     n_batches=self.prog_batches,
                     rays_per_batch=self.prog_rays_batch,
-                    display_per_batch=self.prog_disp_batch,
+                    display_per_batch=n_disp,
                     progress_cb=prog,
                     should_cancel=should_cancel,
                 )
@@ -1256,18 +1433,23 @@ class OptiFluxApp(tk.Tk):
     # ── Drawing ──────────────────────────────────────────────────────────
 
     def _style_axes(self):
-        for ax in (self.ax_side, self.ax_tgt):
+        axes = [self.ax_side, self.ax_tgt]
+        if hasattr(self, "ax_prof"):
+            axes.append(self.ax_prof)
+        for ax in axes:
             ax.set_facecolor(BG)
-            ax.tick_params(colors=FG, labelsize=8)
+            ax.tick_params(colors="#f8fafc", labelsize=8)
             for spine in ax.spines.values():
                 spine.set_color(BORDER)
-            ax.xaxis.label.set_color(FG)
-            ax.yaxis.label.set_color(FG)
+            ax.xaxis.label.set_color("#f8fafc")
+            ax.yaxis.label.set_color("#f8fafc")
             ax.title.set_color(FG_BRIGHT)
 
     def _redraw_empty(self):
         self.ax_side.clear()
         self.ax_tgt.clear()
+        if hasattr(self, "ax_prof"):
+            self.ax_prof.clear()
         self._style_axes()
         self.ax_side.set_title("SIDE VIEW  ·  Y–Z meridional", loc="left", fontsize=10)
         self.ax_side.set_xlabel("Z (mm)")
@@ -1275,8 +1457,15 @@ class OptiFluxApp(tk.Tk):
         self.ax_tgt.set_title("TARGET PLANE  ·  irradiance (source → field)", loc="left", fontsize=10)
         self.ax_tgt.set_xlabel("X (mm)")
         self.ax_tgt.set_ylabel("Y (mm)")
+        if hasattr(self, "ax_prof"):
+            self.ax_prof.set_title("PROFILES  ·  X / Y / diagonal", loc="left", fontsize=10)
+            self.ax_prof.set_xlabel("Position along cut (mm)")
+            self.ax_prof.set_ylabel("Normalized irradiance")
         self.fig_side.tight_layout()
         self.fig_tgt.tight_layout()
+        if hasattr(self, "fig_prof"):
+            self.fig_prof.tight_layout()
+            self.canvas_prof.draw_idle()
         self.canvas_side.draw_idle()
         self.canvas_tgt.draw_idle()
 
@@ -1287,6 +1476,7 @@ class OptiFluxApp(tk.Tk):
         self._draw_side()
         if self._drag is None:
             self._draw_target()
+            self._draw_profiles()
 
     def _connect_side_mouse(self):
         c = self.canvas_side
@@ -1432,28 +1622,84 @@ class OptiFluxApp(tk.Tk):
         return layout
 
     def _pick_element(self, z: float, y: float) -> Optional[Dict[str, Any]]:
+        hit = self._pick_element_interaction(z, y)
+        return hit[0] if hit else None
+
+    def _pick_element_interaction(
+        self, z: float, y: float
+    ) -> Optional[tuple]:
+        """
+        Return (handle_dict, mode) where mode is 'move' or 'resize'.
+
+        Top/bottom rim near ±aperture → resize clear aperture.
+        Centre handle / body → move along Z.
+        """
         if not self._element_handles:
             return None
         best = None
         best_d = 1e9
+        best_mode = "move"
         res = self.result
         for h in self._element_handles:
-            ap = h["aperture"]
-            y_lim = ap * 1.15
+            ap = max(float(h["aperture"]), 0.5)
+            zf, zr = float(h["front_z"]), float(h["rear_z"])
+            z_mid = 0.5 * (zf + zr)
+            # Visible top/bottom of the optic in side view
+            y_top, y_bot = ap, -ap
             if h.get("mla") and res and res.dies:
                 ys = [d.cy for d in res.dies]
-                y_lim = max(abs(min(ys)), abs(max(ys))) + ap * 1.2
-            if h["front_z"] - 1.5 <= z <= h["rear_z"] + 1.5 and abs(y) <= y_lim:
-                d = abs(z - 0.5 * (h["front_z"] + h["rear_z"]))
+                y_top = max(ys) + ap
+                y_bot = min(ys) - ap
+            y_lim = max(abs(y_top), abs(y_bot)) * 1.15
+            in_z = (zf - 2.0) <= z <= (zr + 2.0)
+            # Distance to top / bottom resize grips (prefer these when close)
+            d_top = math.hypot(z - z_mid, y - y_top)
+            d_bot = math.hypot(z - z_mid, y - y_bot)
+            d_edge = min(d_top, d_bot)
+            # Also accept near the rim anywhere along the element thickness
+            if in_z:
+                d_edge = min(d_edge, abs(y - y_top), abs(y - y_bot))
+            edge_hit_r = max(1.2, 0.18 * ap, 0.08 * max(zr - zf, 1.0))
+            if d_edge <= edge_hit_r and in_z:
+                if d_edge < best_d:
+                    best_d = d_edge
+                    best = h
+                    best_mode = "resize"
+                continue
+            # Body / centre → move
+            if in_z and abs(y) <= y_lim:
+                d = abs(z - z_mid) + 0.15 * abs(y)  # prefer centre
                 if d < best_d:
                     best_d = d
                     best = h
+                    best_mode = "move"
             else:
-                d = math.hypot(z - h["front_z"], max(0.0, abs(y) - y_lim))
+                d = math.hypot(z - zf, max(0.0, abs(y) - y_lim))
                 if d < 3.0 and d < best_d:
                     best_d = d
                     best = h
-        return best
+                    best_mode = "move"
+        if best is None:
+            return None
+        return best, best_mode
+
+    def _apply_element_aperture(self, elem_index: int, new_ap: float) -> None:
+        """Set semi-aperture (mm) for an element; keep Y in sync when elliptical."""
+        if elem_index < 0 or elem_index >= len(self.elem_vars):
+            return
+        ap = max(1.0, min(50.0, float(new_ap)))
+        ev = self.elem_vars[elem_index]
+        # MLA: driving aperture is fill factor / lenslet size — update design aperture
+        # so scaled MLA follows after re-trace
+        old_ap = max(float(ev["aperture"].get()), 1e-6)
+        ev["aperture"].set(round(ap, 3))
+        if bool(ev.get("use_elliptical_ap") and ev["use_elliptical_ap"].get()):
+            old_apy = max(float(ev["aperture_y"].get()), 1e-6)
+            ratio = ap / old_ap
+            ev["aperture_y"].set(round(max(1.0, min(50.0, old_apy * ratio)), 3))
+        else:
+            ev["aperture_y"].set(round(ap, 3))
+        self.status_var.set(f"Element {elem_index + 1} semi-aperture → {ap:.2f} mm")
 
     def _clamp_element_front_z(self, elem_index: int, new_front: float) -> float:
         p = self.collect_params()
@@ -1512,27 +1758,38 @@ class OptiFluxApp(tk.Tk):
             }
             self.canvas_side.get_tk_widget().configure(cursor="fleur")
             return
-        # Left = drag lens element (if hit)
+        # Left = drag lens element (move) or top/bottom rim (resize aperture)
         if event.button != 1:
             return
         if event.xdata is None or event.ydata is None or self._running:
             return
-        hit = self._pick_element(float(event.xdata), float(event.ydata))
-        if hit is None:
+        picked = self._pick_element_interaction(float(event.xdata), float(event.ydata))
+        if picked is None:
             return
+        hit, mode = picked
         self._drag = {
+            "mode": mode,
             "elem_index": hit["index"],
             "label": hit["label"],
             "orig_front": hit["front_z"],
             "press_z": float(event.xdata),
+            "press_y": float(event.ydata),
             "current_front": hit["front_z"],
             "aperture": hit["aperture"],
+            "orig_aperture": hit["aperture"],
+            "current_aperture": hit["aperture"],
             "thickness": hit["thickness"],
         }
-        self.canvas_side.get_tk_widget().configure(cursor="sb_h_double_arrow")
-        self.status_var.set(
-            f"Dragging {hit['label']}  ·  release to re-trace  ·  Z = {hit['front_z']:.2f} mm"
-        )
+        if mode == "resize":
+            self.canvas_side.get_tk_widget().configure(cursor="sb_v_double_arrow")
+            self.status_var.set(
+                f"Resizing {hit['label']}  ·  semi-aperture = {hit['aperture']:.2f} mm  ·  release to re-trace"
+            )
+        else:
+            self.canvas_side.get_tk_widget().configure(cursor="sb_h_double_arrow")
+            self.status_var.set(
+                f"Dragging {hit['label']}  ·  release to re-trace  ·  Z = {hit['front_z']:.2f} mm"
+            )
 
     def _on_side_motion(self, event):
         # Pan takes priority when active
@@ -1558,12 +1815,32 @@ class OptiFluxApp(tk.Tk):
 
         if self._drag is None:
             if event.inaxes == self.ax_side and event.xdata is not None and event.ydata is not None:
-                hit = self._pick_element(float(event.xdata), float(event.ydata))
-                self.canvas_side.get_tk_widget().configure(
-                    cursor="sb_h_double_arrow" if hit else "hand2"
+                picked = self._pick_element_interaction(
+                    float(event.xdata), float(event.ydata)
                 )
+                if picked is None:
+                    cur = "hand2"
+                elif picked[1] == "resize":
+                    cur = "sb_v_double_arrow"
+                else:
+                    cur = "sb_h_double_arrow"
+                self.canvas_side.get_tk_widget().configure(cursor=cur)
             return
-        if event.inaxes != self.ax_side or event.xdata is None:
+        if event.inaxes != self.ax_side:
+            return
+        mode = self._drag.get("mode", "move")
+        if mode == "resize":
+            if event.ydata is None:
+                return
+            # Semi-aperture = |Y| from optical axis (top or bottom drag)
+            new_ap = max(1.0, min(50.0, abs(float(event.ydata))))
+            self._drag["current_aperture"] = new_ap
+            self.status_var.set(
+                f"Resizing {self._drag['label']}  ·  semi-aperture = {new_ap:.2f} mm  ·  release to re-trace"
+            )
+            self._draw_side()
+            return
+        if event.xdata is None:
             return
         dz = float(event.xdata) - self._drag["press_z"]
         new_front = self._clamp_element_front_z(
@@ -1585,6 +1862,22 @@ class OptiFluxApp(tk.Tk):
         drag = self._drag
         self._drag = None
         self.canvas_side.get_tk_widget().configure(cursor="hand2")
+        mode = drag.get("mode", "move")
+        if mode == "resize":
+            new_ap = float(drag.get("current_aperture", drag["orig_aperture"]))
+            if abs(new_ap - float(drag["orig_aperture"])) < 1e-3:
+                self.status_var.set("Ready")
+                self._draw_side()
+                return
+            self._apply_element_aperture(drag["elem_index"], new_ap)
+            if self._debounce_id is not None:
+                self.after_cancel(self._debounce_id)
+                self._debounce_id = None
+            self.status_var.set(
+                f"{drag['label']} semi-aperture = {new_ap:.2f} mm — tracing…"
+            )
+            self.run_trace()
+            return
         new_front = drag["current_front"]
         if abs(new_front - drag["orig_front"]) < 1e-4:
             self.status_var.set("Ready")
@@ -1801,9 +2094,18 @@ class OptiFluxApp(tk.Tk):
 
         drag_idx = None
         drag_dz = 0.0
+        drag_mode = "move"
+        drag_ap = None
         if self._drag is not None:
             drag_idx = self._drag["elem_index"]
-            drag_dz = self._drag["current_front"] - self._drag["orig_front"]
+            drag_mode = self._drag.get("mode", "move")
+            drag_dz = (
+                self._drag["current_front"] - self._drag["orig_front"]
+                if drag_mode == "move"
+                else 0.0
+            )
+            if drag_mode == "resize":
+                drag_ap = float(self._drag.get("current_aperture", self._drag["orig_aperture"]))
 
         pairs = self._surface_pairs(res.surfaces)
         mla_mode = any(s.label.startswith("MLA") for s in res.surfaces)
@@ -1814,10 +2116,13 @@ class OptiFluxApp(tk.Tk):
         for s in res.surfaces:
             y_ext = max(y_ext, abs(s.y0) + s.aperture * 1.2)
         for h in layout:
-            y_ext = max(y_ext, h["aperture"] * 1.15)
+            ap_h = drag_ap if (drag_idx is not None and h["index"] == drag_idx and drag_ap is not None) else h["aperture"]
+            y_ext = max(y_ext, float(ap_h) * 1.15)
+        if drag_ap is not None:
+            y_ext = max(y_ext, drag_ap * 1.2)
         z0 = min((d.cz for d in res.dies), default=0) - 5
         z_max_optics = max((s.z_vertex for s in res.surfaces), default=10)
-        if self._drag is not None:
+        if self._drag is not None and drag_mode == "move":
             z_max_optics = max(
                 z_max_optics, self._drag["current_front"] + self._drag["thickness"]
             )
@@ -1869,42 +2174,85 @@ class OptiFluxApp(tk.Tk):
                 compact=is_mla or n_mla > 4,
             )
 
-        # Drag handles: for MLA, one handle for the whole array (element 0)
+        # Drag handles: centre = move Z; top/bottom diamonds = resize aperture
         for h in layout:
             zf = h["front_z"]
             zr = h["rear_z"]
+            ap = float(h["aperture"])
             if drag_idx is not None and h["index"] == drag_idx:
-                zf = self._drag["current_front"]
-                zr = zf + h["thickness"]
-            ap = h["aperture"]
-            # Span handle over array height when MLA is active
+                if drag_mode == "move":
+                    zf = self._drag["current_front"]
+                    zr = zf + h["thickness"]
+                if drag_ap is not None:
+                    ap = drag_ap
+            # Span centre handle over a small band (or array height for MLA)
             if mla_mode and h["index"] == 0 and res.dies:
                 ys = [d.cy for d in res.dies]
                 y_lo = min(ys) - ap
                 y_hi = max(ys) + ap
+                y_top_grip = y_hi
+                y_bot_grip = y_lo
             else:
                 y_lo, y_hi = -ap * 0.2, ap * 0.2
+                y_top_grip, y_bot_grip = ap, -ap
             active = drag_idx is not None and h["index"] == drag_idx
+            resizing = active and drag_mode == "resize"
+            moving = active and drag_mode == "move"
             z_handle = 0.5 * (zf + zr)
+            # Vertical dashed centre line (move)
             ax.plot(
                 [z_handle, z_handle],
                 [y_lo, y_hi],
-                color="#fbbf24" if active else "#94a3b8",
+                color="#fbbf24" if moving else "#94a3b8",
                 lw=1.8,
                 solid_capstyle="round",
                 zorder=6,
-                linestyle="--" if active else ":",
+                linestyle="--" if moving else ":",
                 alpha=0.9,
             )
             ax.plot(
                 z_handle,
-                0 if not mla_mode else 0.5 * (y_lo + y_hi),
+                0 if not (mla_mode and h["index"] == 0) else 0.5 * (y_lo + y_hi),
                 "s",
                 color="#fbbf24",
                 ms=6,
                 zorder=7,
                 markeredgecolor="#0b0f14",
             )
+            # Top / bottom resize grips
+            grip_col = "#38bdf8" if resizing else "#64748b"
+            for yg in (y_top_grip, y_bot_grip):
+                ax.plot(
+                    [zf, zr],
+                    [yg, yg],
+                    color=grip_col,
+                    lw=1.4 if resizing else 1.0,
+                    solid_capstyle="round",
+                    zorder=6,
+                    linestyle="-" if resizing else "--",
+                    alpha=0.95,
+                )
+                ax.plot(
+                    z_handle,
+                    yg,
+                    "D",
+                    color="#38bdf8" if resizing else "#94a3b8",
+                    ms=7 if resizing else 5,
+                    zorder=8,
+                    markeredgecolor="#0b0f14",
+                    markeredgewidth=0.6,
+                )
+            # Live aperture preview outline while resizing
+            if resizing:
+                ax.plot(
+                    [zf, zr, zr, zf, zf],
+                    [y_bot_grip, y_bot_grip, y_top_grip, y_top_grip, y_bot_grip],
+                    color="#38bdf8",
+                    lw=1.2,
+                    alpha=0.55,
+                    zorder=5,
+                    linestyle=":",
+                )
             label = h["label"]
             if mla_mode and h["index"] == 0 and "MLA" not in label:
                 label = label + " MLA"
@@ -1920,8 +2268,17 @@ class OptiFluxApp(tk.Tk):
             )
 
         if self._drag is None:
+            color_cls = bool(getattr(self, "v_color_partial", None) and self.v_color_partial.get())
+            stack_need, only_mla = self._stack_element_counts(res)
+            # Meridional slice: side view is Y–Z. Rays with large |X| can cross the
+            # lens silhouette while missing the circular aperture in 3D, which made
+            # partial-stack rays look like they went through every element.
+            max_ap = max((float(h["aperture"]) for h in layout), default=10.0)
+            slice_half = max(0.8, 0.10 * max_ap)
             for path in res.paths:
                 if len(path.history) < 2:
+                    continue
+                if not self._path_in_meridional_slice(path, slice_half):
                     continue
                 ev = getattr(path, "events", None) or []
                 # Rays that never refracted miss the clear aperture / optics —
@@ -1930,6 +2287,7 @@ class OptiFluxApp(tk.Tk):
                     e == "refract" for e in ev
                 )
                 miss_scale = 1.0 if through_lens else 0.12
+                cls = self._classify_path(path, stack_need, only_mla) if color_cls else None
                 for j in range(len(path.history) - 1):
                     p0, p1 = path.history[j], path.history[j + 1]
                     kind = ev[j] if j < len(ev) else "refract"
@@ -1939,10 +2297,16 @@ class OptiFluxApp(tk.Tk):
                         col, al, lw = "#ef4444", 0.65, 1.0
                     elif kind == "ghost":
                         col, al, lw = "#64748b", 0.25, 0.5
+                    elif cls == "miss":
+                        col, al, lw = "#22d3ee", 0.45, 0.65
+                    elif cls == "partial":
+                        col, al, lw = "#f59e0b", 0.55, 0.85
+                    elif cls == "full":
+                        col, al, lw = "#4ade80", 0.50, 0.80
                     else:
                         col, al, lw = "#7dd3fc", 0.35, 0.7
                     al = max(0.04, al * miss_scale)
-                    if not through_lens:
+                    if not through_lens and not color_cls:
                         lw = min(lw, 0.55)
                     ax.plot(
                         [p0[2], p1[2]],
@@ -1961,7 +2325,7 @@ class OptiFluxApp(tk.Tk):
         ax.text(target_z, fy1, " FOV", color=FOV, fontsize=8, va="bottom")
 
         n_lenslets = sum(1 for s in res.surfaces if s.label.endswith("S1") and s.label.startswith("MLA"))
-        title = "SIDE VIEW  ·  scroll zoom · right-drag pan · left-drag lens"
+        title = "SIDE VIEW  ·  meridional slice  ·  scroll/pan/drag"
         if n_lenslets:
             title = f"SIDE VIEW  ·  MLA {n_lenslets} lenslets  ·  scroll/pan/drag"
         if self._drag is not None:
@@ -2116,6 +2480,124 @@ class OptiFluxApp(tk.Tk):
         self._apply_tgt_limits(ax)
         self.canvas_tgt.draw_idle()
 
+    def _stack_element_counts(self, res) -> tuple:
+        """Return (n_elements_required_for_full, only_mla)."""
+        from engine import element_id_from_label
+
+        stack_ids = []
+        seen = set()
+        for s in res.surfaces:
+            eid = element_id_from_label(getattr(s, "label", "") or "")
+            if not eid or eid in seen:
+                continue
+            seen.add(eid)
+            stack_ids.append(eid)
+        only_mla = bool(stack_ids) and all(x.startswith("MLA") for x in stack_ids)
+        if only_mla:
+            return 1, True
+        bulk = [x for x in stack_ids if not x.startswith("MLA")]
+        return max(1, len(bulk)), False
+
+    @staticmethod
+    def _path_in_meridional_slice(path, slice_half_mm: float) -> bool:
+        from engine import path_in_meridional_slice
+
+        return path_in_meridional_slice(path, slice_half_mm)
+
+    def _classify_path(self, path, stack_need: int, only_mla: bool) -> str:
+        """
+        Classify by *refracted* element ids (true surface hits), not by the
+        Y–Z silhouette. A ray can cross a lens outline in the side view while
+        missing the circular clear aperture in 3D (large |X|).
+        """
+        hit = list(getattr(path, "elements_hit", None) or [])
+        if only_mla:
+            n_hit = 1 if hit else 0
+            need = 1
+        else:
+            n_hit = len([x for x in hit if not str(x).startswith("MLA")])
+            need = max(1, int(stack_need))
+        if n_hit <= 0:
+            return "miss"
+        if n_hit < need:
+            return "partial"
+        return "full"
+
+    def _draw_profiles(self):
+        """Always-visible X / Y / diagonal irradiance cuts with FOV markers."""
+        if not hasattr(self, "fig_prof"):
+            return
+        self.fig_prof.clf()
+        ax = self.fig_prof.add_subplot(111)
+        self.ax_prof = ax
+        self._style_axes()
+        res = self.result
+        if res is None:
+            self.canvas_prof.draw_idle()
+            return
+        p = self.collect_params()
+        grid = np.asarray(res.map.as_grid(), dtype=float)
+        ny, nx = grid.shape
+        hw, hh = float(res.map.half_w), float(res.map.half_h)
+        xs = np.linspace(-hw, hw, nx)
+        ys = np.linspace(hh, -hh, ny)
+        ix0 = int(np.argmin(np.abs(xs)))
+        iy0 = int(np.argmin(np.abs(ys)))
+        prof_x = grid[iy0, :]
+        prof_y = grid[:, ix0]
+        n_diag = min(nx, ny)
+        t = np.linspace(-min(hw, hh), min(hw, hh), n_diag)
+
+        def sample(xx, yy):
+            fx = (xx + hw) / max(2 * hw, 1e-9) * (nx - 1)
+            fy = (hh - yy) / max(2 * hh, 1e-9) * (ny - 1)
+            i0 = int(np.clip(np.floor(fx), 0, nx - 2))
+            j0 = int(np.clip(np.floor(fy), 0, ny - 2))
+            tx, ty = fx - i0, fy - j0
+            return (
+                (1 - tx) * (1 - ty) * grid[j0, i0]
+                + tx * (1 - ty) * grid[j0, i0 + 1]
+                + (1 - tx) * ty * grid[j0 + 1, i0]
+                + tx * ty * grid[j0 + 1, i0 + 1]
+            )
+
+        prof_d = np.array([sample(tt, tt) for tt in t])
+
+        def norm(a):
+            m = float(np.max(a)) if a.size else 0.0
+            return a / m if m > 0 else a
+
+        fov_w = float(p["fov_width"])
+        fov_h = float(p["fov_height"])
+        fov_cx = float(p.get("fov_cx", 0.0))
+        fov_cy = float(p.get("fov_cy", 0.0))
+        ax.plot(xs, norm(prof_x), color="#38bdf8", lw=1.6, label="X-axis cut (Y = 0)")
+        ax.plot(ys, norm(prof_y), color="#a78bfa", lw=1.6, label="Y-axis cut (X = 0)")
+        ax.plot(t, norm(prof_d), color="#fbbf24", lw=1.6, label="XY diagonal")
+        ax.axvline(fov_cx - fov_w / 2, color="#c084fc", ls="--", lw=1.1, alpha=0.9, label="FOV X edge")
+        ax.axvline(fov_cx + fov_w / 2, color="#c084fc", ls="--", lw=1.1, alpha=0.9)
+        ax.axvline(fov_cy - fov_h / 2, color="#e879f9", ls="--", lw=1.1, alpha=0.9, label="FOV Y edge")
+        ax.axvline(fov_cy + fov_h / 2, color="#e879f9", ls="--", lw=1.1, alpha=0.9)
+        d_lim = min(fov_w / 2, fov_h / 2)
+        ax.axvline(-d_lim, color="#fbbf24", ls=":", lw=1.0, alpha=0.7, label="FOV on diagonal")
+        ax.axvline(d_lim, color="#fbbf24", ls=":", lw=1.0, alpha=0.7)
+        ax.set_xlabel("Position along cut (mm)", color="#f8fafc")
+        ax.set_ylabel("Normalized irradiance", color="#f8fafc")
+        ax.set_title("PROFILES  ·  X / Y / diagonal", loc="left", fontsize=10, color=FG_BRIGHT)
+        ax.tick_params(colors="#f8fafc", labelsize=8)
+        leg = ax.legend(
+            fontsize=7,
+            loc="upper right",
+            facecolor=BG2,
+            edgecolor=BORDER,
+            labelcolor="#f8fafc",
+        )
+        ax.grid(True, alpha=0.25, color=BORDER)
+        for sp in ax.spines.values():
+            sp.set_color(BORDER)
+        self.fig_prof.tight_layout()
+        self.canvas_prof.draw_idle()
+
     def _draw_target(self):
         self.fig_tgt.clf()
         ax = self.fig_tgt.add_subplot(111)
@@ -2161,16 +2643,56 @@ class OptiFluxApp(tk.Tk):
         ax.plot(cx, cy, "+", color="white", ms=10, mew=1.5)
         ax.axhline(0, color="#64748b", ls=":", lw=0.7, alpha=0.5)
         ax.axvline(0, color="#64748b", ls=":", lw=0.7, alpha=0.5)
+
+        # Optional overlay: color ray endpoints by how many elements they hit
+        if getattr(self, "v_color_partial", None) is not None and bool(self.v_color_partial.get()):
+            stack_need, only_mla = self._stack_element_counts(res)
+            xs_m, ys_m = [], []
+            xs_p, ys_p = [], []
+            xs_f, ys_f = [], []
+            target_z = float(p.get("target_z", 80.0))
+            for path in res.paths:
+                if len(path.history) < 1:
+                    continue
+                pt = path.history[-1]
+                if abs(pt[2] - target_z) > 1.5 and path.terminated != "target":
+                    continue
+                cls = self._classify_path(path, stack_need, only_mla)
+                if cls == "miss":
+                    xs_m.append(pt[0])
+                    ys_m.append(pt[1])
+                elif cls == "partial":
+                    xs_p.append(pt[0])
+                    ys_p.append(pt[1])
+                else:
+                    xs_f.append(pt[0])
+                    ys_f.append(pt[1])
+            if xs_m:
+                ax.scatter(xs_m, ys_m, s=10, c="#22d3ee", alpha=0.6, zorder=6, label="Missed lenses")
+            if xs_p:
+                ax.scatter(xs_p, ys_p, s=12, c="#f59e0b", alpha=0.75, zorder=7, label="Partial stack")
+            if xs_f:
+                ax.scatter(xs_f, ys_f, s=11, c="#4ade80", alpha=0.7, zorder=8, label="Full stack")
+            if xs_m or xs_p or xs_f:
+                ax.legend(
+                    fontsize=7,
+                    loc="upper right",
+                    facecolor=BG2,
+                    edgecolor=BORDER,
+                    labelcolor="#f8fafc",
+                )
+
         ax.set_title(
             "TARGET PLANE  ·  scroll zoom  ·  right-drag pan",
             loc="left",
             fontsize=10,
             color=FG_BRIGHT,
         )
-        ax.set_xlabel("X (mm)")
-        ax.set_ylabel("Y (mm)")
+        ax.set_xlabel("X (mm)", color="#f8fafc")
+        ax.set_ylabel("Y (mm)", color="#f8fafc")
+        ax.tick_params(colors="#f8fafc", labelsize=8)
         cbar = self.fig_tgt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-        cbar.ax.yaxis.set_tick_params(color=FG, labelsize=7)
+        cbar.ax.yaxis.set_tick_params(color="#f8fafc", labelsize=7)
         cbar.outline.set_edgecolor(BORDER)
         for spine in cbar.ax.spines.values():
             spine.set_color(BORDER)
@@ -2339,10 +2861,15 @@ class OptiFluxApp(tk.Tk):
         self.v_tir_abs.set(p.get("absorb_on_tir", True))
         if hasattr(self, "v_kill_back"):
             self.v_kill_back.set(p.get("kill_backward", True))
-        for i, e in enumerate(p["elements"]):
+        elems = pad_elements(p.get("elements") or [], MAX_ELEMENTS)
+        p["elements"] = elems
+        for i, e in enumerate(elems):
             if i >= len(self.elem_vars):
                 break
             self._apply_element_dict_to_vars(i, e)
+            # Collapse disabled slots so the side panel stays compact
+            if hasattr(self, "elem_ui") and i < len(self.elem_ui):
+                self._set_element_collapsed(i, collapsed=not bool(e.get("enabled", False)))
         self.v_target_z.set(p["target_z"])
         self._fov_syncing = True
         try:
@@ -2367,6 +2894,10 @@ class OptiFluxApp(tk.Tk):
         self.v_export_plate.set(bool(mla.get("export_plate", True)))
         if hasattr(self, "v_mla_scale"):
             self.v_mla_scale.set(bool(mla.get("scale_to_pitch", True)))
+        if hasattr(self, "v_mla_aim"):
+            self.v_mla_aim.set(bool(mla.get("aim_to_fov", True)))
+        if hasattr(self, "v_mla_aim_s"):
+            self.v_mla_aim_s.set(float(mla.get("aim_strength", 1.0)))
 
     def _on_element_shape_selected(self, elem_index: int):
         """User picked a library type for one element — apply immediately."""
@@ -2413,6 +2944,232 @@ class OptiFluxApp(tk.Tk):
         finally:
             self._fov_syncing = False
         self._on_param_change()
+
+    def _swap_anamorphic_xy(self):
+        """Swap cylinder/biconic X↔Y powers — fixes a 90° rotated footprint."""
+        p = self.collect_params()
+        p2 = swap_anamorphic_xy_params(p)
+        n = 0
+        for i, el in enumerate(p2.get("elements", [])):
+            if i >= len(self.elem_vars):
+                break
+            if not el.get("enabled", True):
+                continue
+            mode = str(el.get("surface_mode", "")).lower()
+            if mode in ("cylinder_x", "cylinder_y", "biconic") or el.get("R1y") is not None:
+                self._apply_element_dict_to_vars(i, el)
+                n += 1
+        if n == 0:
+            self.design_status.set("No anamorphic elements to swap (need cylinder/biconic).")
+            messagebox.showinfo(
+                "Swap X/Y",
+                "No cylindrical or biconic elements are enabled.\n"
+                "Use “Crossed cylinders” or “Biconic singlet” first, or set "
+                "an element surface mode to cylinder/biconic.",
+            )
+            return
+        self.design_status.set(f"Swapped X↔Y on {n} anamorphic element(s). Re-trace to verify.")
+        self.status_var.set(self.design_status.get())
+        self._on_param_change()
+
+    def _rotate_optics_90_vs_fov(self):
+        """
+        Rotate the rectangular FOV 90° and swap anamorphic X/Y so the lens
+        powers track the new orientation.
+        """
+        try:
+            w = float(self.v_fov_w.get())
+            h = float(self.v_fov_h.get())
+        except (tk.TclError, ValueError):
+            return
+        self._fov_syncing = True
+        try:
+            self.v_fov_w.set(h)
+            self.v_fov_h.set(w)
+            if h > 1e-9:
+                self.v_fov_aspect.set(round(h / w, 4) if w > 1e-9 else 1.0)
+            else:
+                self.v_fov_aspect.set(1.0)
+        finally:
+            self._fov_syncing = False
+        # Swap lens axes to match the rotated FOV
+        p = self.collect_params()
+        p2 = swap_anamorphic_xy_params(p)
+        n = 0
+        for i, el in enumerate(p2.get("elements", [])):
+            if i >= len(self.elem_vars):
+                break
+            mode = str(el.get("surface_mode", "")).lower()
+            if mode in ("cylinder_x", "cylinder_y", "biconic") or el.get("R1y") is not None:
+                self._apply_element_dict_to_vars(i, el)
+                n += 1
+        self.design_status.set(
+            f"FOV rotated 90° (now {h:.1f}×{w:.1f} mm)"
+            + (f"; swapped X↔Y on {n} element(s)" if n else "")
+            + ". Re-trace."
+        )
+        self.status_var.set(self.design_status.get())
+        self._on_param_change()
+
+    def _on_partial_ray_color_toggle(self):
+        if self.result is not None:
+            self._draw_target()
+            self._draw_side()
+
+    def _show_help(self):
+        """Load HELP.txt from the program folder (not hardcoded)."""
+        help_path = Path(__file__).resolve().parent / "HELP.txt"
+        win = tk.Toplevel(self)
+        win.title("OptiFlux — Help")
+        win.geometry("720x560")
+        win.configure(bg=BG)
+        frm = ttk.Frame(win)
+        frm.pack(fill="both", expand=True, padx=8, pady=8)
+        txt = tk.Text(
+            frm,
+            wrap="word",
+            bg=BG2,
+            fg=FG,
+            insertbackground=FG,
+            relief="flat",
+            font=("Segoe UI", 10),
+            padx=8,
+            pady=8,
+        )
+        sb = ttk.Scrollbar(frm, orient="vertical", command=txt.yview)
+        txt.configure(yscrollcommand=sb.set)
+        txt.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        try:
+            body = help_path.read_text(encoding="utf-8")
+        except Exception as e:
+            body = (
+                f"Could not load help file:\n  {help_path}\n\n{e}\n\n"
+                "Place HELP.txt next to app.py."
+            )
+        txt.insert("1.0", body)
+        txt.configure(state="disabled")
+        ttk.Button(win, text="Close", command=win.destroy).pack(pady=6)
+
+    def _commercial_lens_report(self, params: dict) -> str:
+        """Human-readable buy-sheet for enabled elements (Edmund-style fields)."""
+        from materials_catalog import refractive_index, material_id_from_name, material_name_from_id
+        from mla_geometry import thin_lens_focal_length_mm
+
+        lines = []
+        lines.append("COMMERCIAL LENS PARAMETER SHEET")
+        lines.append("=" * 56)
+        lines.append("Units: millimetres (mm). Quote these to catalog suppliers")
+        lines.append("(Edmund Optics, Thorlabs, Newport, etc.) or for custom optic RFQs.")
+        lines.append("")
+        src = params.get("source") or {}
+        wl = float(src.get("wavelength_nm", 550.0))
+        lines.append(f"Design wavelength: {wl:.1f} nm")
+        lines.append(f"Target plane Z:    {float(params.get('target_z', 80)):.2f} mm")
+        lines.append(
+            f"FOV (W×H):         {float(params.get('fov_width', 40)):.2f} × "
+            f"{float(params.get('fov_height', 32)):.2f} mm"
+        )
+        lines.append(f"Lens group Z start:{float(params.get('lens_z_start', 3)):.2f} mm")
+        lines.append("")
+        z = float(params.get("lens_z_start", 3.0))
+        any_on = False
+        for i, e in enumerate(params.get("elements") or []):
+            if not e.get("enabled", True):
+                continue
+            any_on = True
+            mid = material_id_from_name(str(e.get("material", "N_BK7")))
+            mat_name = material_name_from_id(mid)
+            n = refractive_index(mid, wl, float(params.get("custom_n", 1.5)))
+            R1 = float(e.get("R1", 0.0) or 0.0)
+            R2 = float(e.get("R2", 0.0) or 0.0)
+            R1y = e.get("R1y")
+            R2y = e.get("R2y")
+            t = float(e.get("thickness", 3.0))
+            ap = float(e.get("aperture", 10.0))
+            apy = e.get("aperture_y")
+            mode = str(e.get("surface_mode", "rotational"))
+            efl = thin_lens_focal_length_mm(R1, R2, n, t)
+            # Edge thickness estimate at circular aperture (rotational sag)
+            from engine import OpticalSurface
+
+            s1 = OpticalSurface(z_vertex=0.0, radius=R1, aperture=ap, material_after=mid)
+            s2 = OpticalSurface(z_vertex=t, radius=R2, aperture=ap, material_after="AIR", material_before=mid)
+            try:
+                from engine import lens_edge_thickness
+
+                et_raw = lens_edge_thickness(s1, s2, ap * 0.98)
+                et = float(et_raw) if et_raw is not None else t
+            except Exception:
+                et = t
+            diam = 2.0 * ap
+            lines.append(f"--- Element {i + 1}  [{mode}] ---")
+            lines.append(f"  Material / catalog glass : {mat_name}  (n≈{n:.4f} @ {wl:.0f} nm)")
+            lines.append(f"  Clear diameter (CA)      : {diam:.3f} mm  (semi-aperture {ap:.3f})")
+            if apy is not None:
+                lines.append(f"  Clear aperture Y         : {2.0 * float(apy):.3f} mm (elliptical)")
+            lines.append(f"  Centre thickness (CT)    : {t:.3f} mm")
+            lines.append(f"  Edge thickness (est.)    : {et:.3f} mm @ r={ap * 0.98:.2f}")
+            lines.append(f"  Front radius R1 (Rx)     : {R1:.4f} mm")
+            lines.append(f"  Rear radius  R2 (Rx)     : {R2:.4f} mm")
+            if R1y is not None or mode in ("biconic", "cylinder_y"):
+                lines.append(f"  Front radius R1y         : {float(R1y) if R1y is not None else 0.0:.4f} mm")
+            if R2y is not None or mode in ("biconic", "cylinder_y"):
+                lines.append(f"  Rear radius  R2y         : {float(R2y) if R2y is not None else 0.0:.4f} mm")
+            lines.append(f"  Conic k1 / k2            : {float(e.get('k1', 0)):.4f} / {float(e.get('k2', 0)):.4f}")
+            lines.append(f"  Asphere A4_1 / A4_2      : {float(e.get('A4_1', 0)):.6g} / {float(e.get('A4_2', 0)):.6g}")
+            lines.append(f"  EFL (thin lensmaker)     : {efl:.3f} mm")
+            lines.append(f"  Vertex Z (front)         : {z:.3f} mm")
+            lines.append(f"  Air gap after element    : {float(e.get('air_after', 0)):.3f} mm")
+            lines.append("")
+            z += t + float(e.get("air_after", 0.0))
+        if not any_on:
+            lines.append("(No enabled lens elements.)")
+        lines.append("Notes for purchasing:")
+        lines.append("  • Prefer stock PCX/DCX with closest |R| and diameter ≥ CA.")
+        lines.append("  • Cylinder / biconic parts are usually custom; specify Rx, Ry, CT, CA.")
+        lines.append("  • Coatings: uncoated Fresnel losses are modeled; AR coats reduce them.")
+        lines.append("  • Sign convention: +R1 = convex toward source; check vendor drawings.")
+        return "\n".join(lines)
+
+    def _show_buy_list_window(self):
+        """Commercial / RFQ lens parameter sheet (profiles live beside the target plane)."""
+        p = self.collect_params()
+        report = self._commercial_lens_report(p)
+        win = tk.Toplevel(self)
+        win.title("OptiFlux — Commercial lens list")
+        win.geometry("640x560")
+        win.configure(bg=BG)
+        bot = ttk.Frame(win)
+        bot.pack(fill="both", expand=True, padx=6, pady=4)
+        ttk.Label(bot, text="Commercial / RFQ lens parameters", style="Dim.TLabel").pack(anchor="w")
+        txt = tk.Text(
+            bot,
+            wrap="word",
+            bg=BG2,
+            fg="#f8fafc",
+            insertbackground="#f8fafc",
+            relief="flat",
+            font=("Consolas", 9),
+            padx=6,
+            pady=6,
+        )
+        sb = ttk.Scrollbar(bot, orient="vertical", command=txt.yview)
+        txt.configure(yscrollcommand=sb.set)
+        txt.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        txt.insert("1.0", report)
+        txt.configure(state="disabled")
+
+        def _copy():
+            self.clipboard_clear()
+            self.clipboard_append(report)
+            self.status_var.set("Commercial lens list copied to clipboard")
+
+        row = ttk.Frame(win)
+        row.pack(fill="x", padx=6, pady=4)
+        ttk.Button(row, text="Copy parameters", command=_copy).pack(side="left", padx=4)
+        ttk.Button(row, text="Close", command=win.destroy).pack(side="right", padx=4)
 
     def _design_rect_fov(self, kind: str = "crossed"):
         """Auto-generate anamorphic optics for the current rectangular FOV."""
@@ -2481,6 +3238,8 @@ class OptiFluxApp(tk.Tk):
             if rm < 1e-6:
                 rm = 25.0
             ev["R_mag"].set(rm)
+        if hasattr(self, "elem_ui") and i < len(self.elem_ui):
+            self.elem_ui[i]["title"].configure(text=self._element_header_text(i, ev))
 
     def _apply_shape_to_element(self, elem_index: int = 0):
         """Apply library lens type to the given element index."""

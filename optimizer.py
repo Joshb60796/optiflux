@@ -373,44 +373,31 @@ def inject_anamorphic_lenses(
     if n_extra < 1:
         return p
 
-    elements = list(p.get("elements") or [])
-    while len(elements) < 3:
-        elements.append(
-            {
-                "enabled": False,
-                "R1": 30.0,
-                "R2": -30.0,
-                "thickness": 3.0,
-                "air_after": 2.0,
-                "aperture": 12.0,
-                "material": "ACRYLIC_PMMA",
-                "shape_id": "custom",
-                "surface_mode": "rotational",
-                "k1": 0.0,
-                "k2": 0.0,
-                "A4_1": 0.0,
-                "A4_2": 0.0,
-                "R1y": None,
-                "R2y": None,
-                "aperture_y": None,
-            }
-        )
+    from engine import MAX_ELEMENTS, pad_elements
 
+    elements = pad_elements(list(p.get("elements") or []), MAX_ELEMENTS)
+
+    # Keep only the primary phase-1 collector enabled as the base optic.
+    # Extra enabled elements from a previous run would otherwise stack with the
+    # new anamorphics (4+ surfaces → Fresnel loss, lower collection).
     enabled_idx = [i for i, e in enumerate(elements) if e.get("enabled", True)]
-    free_idx = [i for i, e in enumerate(elements) if not e.get("enabled", True)]
-    e0 = elements[enabled_idx[0]] if enabled_idx else elements[0]
+    if not enabled_idx:
+        elements[0]["enabled"] = True
+        enabled_idx = [0]
+    collector_i = enabled_idx[0]
+    for i, e in enumerate(elements):
+        if i != collector_i:
+            e["enabled"] = False
+
+    free_idx = [i for i in range(len(elements)) if i != collector_i]
+    e0 = elements[collector_i]
     mat = str(e0.get("material", "ACRYLIC_PMMA"))
     src = p.get("source") or {}
     fov_w = float(p.get("fov_width", 40.0))
     fov_h = float(p.get("fov_height", 32.0))
     target_z = float(p.get("target_z", 80.0))
     lens_z = float(p.get("lens_z_start", 3.0))
-    # Place new lenses after the current stack
-    z_cursor = lens_z
-    for e in elements:
-        if not e.get("enabled", True):
-            continue
-        z_cursor += float(e.get("thickness", 0)) + float(e.get("air_after", 0))
+    z_cursor = lens_z + float(e0.get("thickness", 0)) + float(e0.get("air_after", 0))
 
     use_crossed = mode.lower().startswith("cross") and n_extra >= 2
     kwargs = dict(
@@ -446,24 +433,19 @@ def inject_anamorphic_lenses(
             )
         })
         seeds = [design["elements"][0]]
-        if n_extra >= 2:
-            # Second slot: weak rotational relay / residual corrector
-            weak = copy.deepcopy(design["elements"][0])
-            weak["surface_mode"] = "rotational"
-            weak["R1"] = abs(float(weak.get("R1", 40.0))) * 1.5
-            weak["R2"] = -abs(float(weak.get("R2", 40.0) or weak["R1"])) * 1.5
-            weak["R1y"] = None
-            weak["R2y"] = None
-            weak["enabled"] = True
-            seeds.append(weak)
+        # n_extra>=2 with biconic: only one anamorphic singlet (no weak relay —
+        # extra surfaces mostly cost Fresnel without helping FOV flux)
 
-    # Prefer free slots; if not enough, take highest indices still available
-    slots = list(free_idx)
-    for i in range(len(elements) - 1, -1, -1):
-        if i not in slots and i not in enabled_idx[:1]:
-            # don't overwrite the primary phase-1 collector
+    # Only use free (disabled) slots after the collector — never grow past
+    # collector + len(seeds) enabled elements.
+    slots = [i for i in free_idx if i > collector_i][: len(seeds)]
+    if len(slots) < len(seeds):
+        # fall back to any remaining free indices
+        for i in free_idx:
             if i not in slots:
                 slots.append(i)
+            if len(slots) >= len(seeds):
+                break
     slots = slots[: len(seeds)]
 
     for slot, seed in zip(slots, seeds):
@@ -471,19 +453,18 @@ def inject_anamorphic_lenses(
         seed["enabled"] = True
         seed["shape_id"] = "custom"
         seed["material"] = mat
-        # Keep modest air gap after the collector into the first anamorphic
-        if enabled_idx:
-            elements[enabled_idx[-1]]["air_after"] = max(
-                0.5, float(elements[enabled_idx[-1]].get("air_after", 1.0))
-            )
         elements[slot] = seed
 
+    # Modest air gap after collector into first anamorphic
+    elements[collector_i]["air_after"] = max(
+        0.5, float(elements[collector_i].get("air_after", 1.0))
+    )
+
     p["elements"] = elements
-    # Disable MLA for multi-element anamorphic stacks (array conflicts with cylinders)
     mla = dict(p.get("mla") or {})
     mla["enabled"] = False
     p["mla"] = mla
-    p["_anamorphic_slots"] = list(slots)  # for phase-2 free-variable restriction
+    p["_anamorphic_slots"] = list(slots)
     return p
 
 
@@ -529,11 +510,14 @@ def evaluate_fov_flux(
     footprint_aspect = float(fov.get("footprint_aspect", 1.0))
     coverage = float(fov.get("coverage", 0.0))
     size_error = float(fov.get("size_error", 1.0))
+    orientation_flipped = float(fov.get("orientation_flipped", 0.0))
+    # Line-cut fill (X & Y profiles through FOV centre) — matches the profile plot
+    profile_fill = float(fov.get("profile_fill", coverage))
 
-    # Mix coverage into the flux term so a small central hot-spot cannot "win"
+    # Mix coverage + profile fill so a small central hot-spot cannot "win"
     # solely by concentrating power in a few FOV bins.
     mix = min(1.0, max(0.0, float(cfg.coverage_mix)))
-    fill_factor = (1.0 - mix) + mix * coverage
+    fill_factor = (1.0 - mix) + mix * (0.5 * coverage + 0.5 * profile_fill)
     score = fov_flux * fill_factor * (1.0 + float(cfg.uniformity_weight) * uniformity)
     w_a = float(cfg.aspect_weight)
     if w_a > 0:
@@ -541,6 +525,14 @@ def evaluate_fov_flux(
     w_s = float(cfg.fill_weight)
     if w_s > 0:
         score = score / (1.0 + w_s * size_error)
+    # Landscape FOV must not keep a portrait beam (and vice versa).
+    if orientation_flipped > 0.5:
+        score *= 0.35
+    # Mild complexity cost: each enabled element adds surfaces/Fresnel. Prefer
+    # simpler stacks when FOV flux is otherwise similar.
+    n_en = sum(1 for e in p.get("elements", []) if e.get("enabled", True))
+    if n_en > 1:
+        score = score / (1.0 + 0.04 * (n_en - 1))
     score -= _geometry_penalty(p, cfg.penalty_scale)
     return score, fov_flux, uniformity, collection, aspect_error, footprint_aspect
 
@@ -726,6 +718,34 @@ def _optimize_once(
     if score > best_score[0]:
         best_score[0] = score
 
+    # If the footprint is landscape/portrait-flipped vs FOV, try swapping
+    # anamorphic X↔Y once — often recovers the correct orientation.
+    try:
+        from rect_fov import swap_anamorphic_xy_params
+
+        p_check = copy.deepcopy(final_params)
+        p_check["total_rays"] = int(cfg.rays_per_eval)
+        p_check["display_rays"] = 0
+        p_check["map_res"] = int(cfg.map_res)
+        if cfg.force_cpu:
+            p_check["use_warp"] = False
+        st = run_simulation(p_check).stats
+        flipped = float((st.get("fov") or {}).get("orientation_flipped", 0.0))
+        if flipped > 0.5:
+            swapped = swap_anamorphic_xy_params(final_params)
+            sc2, ff2, uni2, col2, ae2, fa2 = evaluate_fov_flux(swapped, cfg)
+            n_evals[0] += 1
+            if sc2 > score:
+                final_params, score = swapped, sc2
+                ff, uni, col, ae, fa = ff2, uni2, col2, ae2, fa2
+                best_score[0] = max(best_score[0], score)
+                _report(
+                    0.98,
+                    f"{tag}Auto-swapped X↔Y (was orientation-flipped) · score={score:.4f}",
+                )
+    except Exception:
+        pass
+
     elapsed = time.perf_counter() - t0
     msg = (
         f"{tag}Done in {elapsed:.1f}s · {n_evals[0]} evals · "
@@ -824,26 +844,36 @@ def optimize_fov_flux(
 
     total_evals = r1.n_evals + r2.n_evals
     elapsed = r1.elapsed_s + r2.elapsed_s
+    history = list(r1.history) + list(r2.history)
+
+    # Keep phase-1 if anamorphics did not improve FOV power. Extra surfaces always
+    # cost Fresnel; only accept P2 when it actually delivers more FOV flux
+    # (small tolerance for MC noise).
+    keep_p2 = r2.fov_flux >= r1.fov_flux * 0.98 and (
+        r2.score >= r1.score * 0.95 or r2.fov_flux > r1.fov_flux
+    )
+    best = r2 if keep_p2 else r1
+    phase = "1+2" if keep_p2 else "1"
+    note = "" if keep_p2 else " · kept P1 (extra lenses did not improve FOV flux)"
     msg = (
         f"Two-phase done in {elapsed:.1f}s · {total_evals} evals · "
-        f"FOV flux={r2.fov_flux * 100:.1f}% · uniformity={r2.uniformity * 100:.1f}% · "
-        f"aspect_err={r2.aspect_error * 100:.1f}% "
-        f"(σx/σy={r2.footprint_aspect:.3f})"
+        f"FOV flux={best.fov_flux * 100:.1f}% · uniformity={best.uniformity * 100:.1f}% · "
+        f"aspect_err={best.aspect_error * 100:.1f}% "
+        f"(σx/σy={best.footprint_aspect:.3f}){note}"
     )
-    history = list(r1.history) + list(r2.history)
     return OptimizeResult(
-        params=r2.params,
-        score=r2.score,
-        fov_flux=r2.fov_flux,
-        uniformity=r2.uniformity,
-        collection=r2.collection,
-        aspect_error=r2.aspect_error,
-        footprint_aspect=r2.footprint_aspect,
+        params=best.params,
+        score=best.score,
+        fov_flux=best.fov_flux,
+        uniformity=best.uniformity,
+        collection=best.collection,
+        aspect_error=best.aspect_error,
+        footprint_aspect=best.footprint_aspect,
         n_evals=total_evals,
         history=history,
         message=msg,
         elapsed_s=elapsed,
-        phase="1+2",
+        phase=phase,
     )
 
 

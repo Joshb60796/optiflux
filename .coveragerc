@@ -1,0 +1,24 @@
+[run]
+source =
+    engine
+    optimizer
+    progressive
+    mla_geometry
+    rect_fov
+    export_cad
+    materials_catalog
+    lens_shapes
+omit =
+    app.py
+    validate_physics.py
+    warp_backend.py
+    tests/*
+    */tests/*
+
+[report]
+precision = 1
+show_missing = True
+skip_empty = True
+fail_under = 0
+# Note: warp_backend.py is optional GPU code; availability is tested separately.
+# Target ≥75% on the modules listed under [run] source.

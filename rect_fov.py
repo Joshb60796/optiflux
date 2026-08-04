@@ -109,11 +109,14 @@ def design_crossed_cylinders_for_rect_fov(
     R_min = ap_max * 1.35
     f_min = R_min / max(n - 1.0, 0.05)
 
-    # Place LED near the mean focal plane for soft collimation in both meridians
+    # Place LED near the mean focal plane for soft collimation in both meridians.
+    # Empirically (OptiFlux condenser): *stronger* power in Y (shorter f_y) shrinks
+    # σy and leaves a wider footprint → landscape. For aspect = W/H > 1:
+    #   f_x long (weaker X), f_y short (stronger Y).
     f_mean = max(f_min, 20.0)
-    # Wider FOV meridian → longer f → slightly more residual divergence from on-axis angles
-    f_x = f_mean * math.sqrt(aspect)
-    f_y = f_mean / math.sqrt(aspect)
+    # Full aspect (not √) so the X/Y difference is clear in the far field
+    f_x = f_mean * aspect  # landscape → weaker X → more σx
+    f_y = f_mean / aspect  # landscape → stronger Y → less σy
     f_x = max(f_x, f_min)
     f_y = max(f_y, f_min)
 
@@ -256,8 +259,9 @@ def design_biconic_singlet_for_rect_fov(
     R_min = max(ap_x, ap_y) * 1.35
     f_min = R_min / max(n - 1.0, 0.05)
     f_mean = max(f_min, 20.0)
-    f_x = max(f_mean * math.sqrt(aspect), f_min)
-    f_y = max(f_mean / math.sqrt(aspect), f_min)
+    # Same mapping as crossed cylinders: landscape → weaker X, stronger Y
+    f_x = max(f_mean * aspect, f_min)
+    f_y = max(f_mean / aspect, f_min)
     L_suggest = 0.9 * min(f_x, f_y)
     lens_z_start = max(float(lens_z_start), source_z + L_suggest)
 
@@ -316,6 +320,62 @@ def design_biconic_singlet_for_rect_fov(
         ),
     }
     return {"elements": [e1, e2, e3], "meta": meta, "lens_z_start": lens_z_start}
+
+
+def swap_anamorphic_xy_element(el: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Swap X/Y powers on one element (in place and returned).
+
+    - cylinder_x ↔ cylinder_y (and mode_s1/s2)
+    - R1 ↔ R1y, R2 ↔ R2y (None stays None if both missing)
+    - aperture ↔ aperture_y when elliptical
+    """
+    mode = str(el.get("surface_mode", "rotational")).lower()
+    if mode == "cylinder_x":
+        el["surface_mode"] = "cylinder_y"
+        el["mode_s1"] = "cylinder_y"
+        el["mode_s2"] = "cylinder_y"
+        # Move X power into Y slots
+        r1, r2 = float(el.get("R1", 0.0) or 0.0), float(el.get("R2", 0.0) or 0.0)
+        el["R1y"] = r1
+        el["R2y"] = r2
+        el["R1"] = 0.0
+        el["R2"] = 0.0
+    elif mode == "cylinder_y":
+        el["surface_mode"] = "cylinder_x"
+        el["mode_s1"] = "cylinder_x"
+        el["mode_s2"] = "cylinder_x"
+        r1y = el.get("R1y", None)
+        r2y = el.get("R2y", None)
+        el["R1"] = float(r1y) if r1y is not None else float(el.get("R1", 0.0) or 0.0)
+        el["R2"] = float(r2y) if r2y is not None else float(el.get("R2", 0.0) or 0.0)
+        el["R1y"] = 0.0
+        el["R2y"] = 0.0
+    elif mode == "biconic" or el.get("R1y") is not None or el.get("R2y") is not None:
+        el["surface_mode"] = "biconic"
+        r1, r2 = float(el.get("R1", 0.0) or 0.0), float(el.get("R2", 0.0) or 0.0)
+        r1y = el.get("R1y", None)
+        r2y = el.get("R2y", None)
+        el["R1"] = float(r1y) if r1y is not None else r1
+        el["R2"] = float(r2y) if r2y is not None else r2
+        el["R1y"] = r1
+        el["R2y"] = r2
+    # Elliptical clear aperture
+    if el.get("aperture_y") is not None:
+        apx = float(el.get("aperture", 10.0))
+        apy = float(el["aperture_y"])
+        el["aperture"], el["aperture_y"] = apy, apx
+    return el
+
+
+def swap_anamorphic_xy_params(params: Dict[str, Any]) -> Dict[str, Any]:
+    """Swap X/Y anamorphic powers on every enabled element."""
+    out = dict(params)
+    out["elements"] = [dict(e) for e in params.get("elements", [])]
+    for el in out["elements"]:
+        if el.get("enabled", True):
+            swap_anamorphic_xy_element(el)
+    return out
 
 
 def footprint_aspect_from_map(samples_x, samples_y, powers, frac: float = 0.5) -> float:

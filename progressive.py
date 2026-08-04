@@ -182,10 +182,15 @@ def _trace_cpu_batch(
                 die = dd
                 break
         o, d, pwr, wl = die.spawn_ray(power_per)
-        store = len(paths) < n_display and (
-            random.random() < (n_display / max(n_rays, 1)) * 1.4
-            or len(paths) < min(40, n_display)
-        )
+        # When this batch exists only to build side-view paths (n_display ≈ n_rays),
+        # store every ray until the budget is filled. Otherwise sample randomly.
+        if n_display >= n_rays:
+            store = len(paths) < n_display
+        else:
+            store = len(paths) < n_display and (
+                random.random() < (n_display / max(n_rays, 1)) * 1.4
+                or len(paths) < min(40, n_display)
+            )
         ok, pt, pwr_out, path = trace_ray(
             o,
             d,
@@ -214,7 +219,14 @@ def _trace_cpu_batch(
             hit += 1
             imap.deposit(pt[0], pt[1], pwr_out)
         if store and path is not None and len(path.history) >= 2:
-            paths.append(path)
+            # Prefer meridional paths (small |X|) for the side-view Y–Z plot so
+            # rays that miss a circular aperture off-axis are not drawn as if
+            # they crossed every lens silhouette.
+            max_x = max(abs(pt[0]) for pt in path.history)
+            if max_x <= 1.5 or len(paths) < max(1, int(n_display * 0.35)) or n_display >= n_rays:
+                paths.append(path)
+            elif len(paths) < n_display and random.random() < 0.25:
+                paths.append(path)
     return paths, launched, hit, n_tir, n_reflect, n_backward, n_miss
 
 
@@ -267,13 +279,38 @@ def run_simulation_progressive(
         Optional poll; return True to stop remaining batches (new user input).
     """
     dies = build_source_array(params["source"])
+    target_z = float(params.get("target_z", 80.0))
+    fov_cx = float(params.get("fov_cx", 0.0))
+    fov_cy = float(params.get("fov_cy", 0.0))
+    mla = dict(params.get("mla") or {})
+    mla["_target_z"] = target_z
+    mla["_fov_cx"] = fov_cx
+    mla["_fov_cy"] = fov_cy
+    if bool(mla.get("enabled", False)) and bool(mla.get("aim_to_fov", True)):
+        from mla_geometry import (
+            apply_mla_die_aim,
+            lenslet_semi_aperture,
+            scale_element_to_lenslet,
+            thin_lens_focal_length_mm,
+        )
+        from materials_catalog import refractive_index, material_id_from_name, VISIBLE_NM_DEFAULT
+
+        e0 = next((e for e in params.get("elements", []) if e.get("enabled", True)), None)
+        if e0 is not None:
+            ap = lenslet_semi_aperture(mla, dies, params.get("source"))
+            g = scale_element_to_lenslet(e0, ap, scale_geometry=bool(mla.get("scale_to_pitch", True)))
+            mat = material_id_from_name(str(e0.get("material", "ACRYLIC_PMMA")))
+            n_g = refractive_index(mat, VISIBLE_NM_DEFAULT, float(params.get("custom_n", 1.5)))
+            f_mm = thin_lens_focal_length_mm(g["R1"], g["R2"], n_g, g["thickness"])
+            apply_mla_die_aim(
+                dies, {**params, "mla": mla}, focal_length=f_mm, aperture=g["aperture"]
+            )
     surfaces = build_surfaces(
         params["elements"],
         float(params.get("lens_z_start", 3.0)),
-        mla=params.get("mla"),
+        mla=mla,
         dies=dies,
     )
-    target_z = float(params.get("target_z", 80.0))
     half_w = float(params.get("map_half_w", 50.0))
     half_h = float(params.get("map_half_h", 40.0))
     res = int(params.get("map_res", 96))
