@@ -546,7 +546,7 @@ class OptiFluxApp(tk.Tk):
         side_tools.pack(side="top", fill="x", padx=8)
         ttk.Label(
             side_tools,
-            text="Side: scroll=zoom · right-drag=pan · left-drag move · top/bottom drag size · double-click=reset",
+            text="Side: move=centre · size=top/bottom · radius=front/rear dots · pan=right-drag · double-click=reset",
             style="Dim.TLabel",
         ).pack(side="left")
         ttk.Button(side_tools, text="Reset side zoom", command=self._reset_side_zoom).pack(
@@ -1057,19 +1057,19 @@ class OptiFluxApp(tk.Tk):
         ttk.Label(
             optz,
             text=(
-                "Objective fills the rectangular FOV: flux × coverage × uniformity, "
-                "penalizing under-size and wrong aspect. Multi-starts several group "
-                "distances (near LED → farther) so conjugate scale is explored. "
-                "Phase 2 adds anamorphic lenses for a rectangular footprint."
+                "Objective: bright even rectangle — flux × FOV coverage × profile "
+                "fill × uniformity (Emin/Emax), penalizing under-size and wrong aspect. "
+                "A thin hot streak cannot beat a filled FOV. Phase 2 adds anamorphic "
+                "lenses (2 = crossed cylinders; 3–4 add a mild relay for evenness)."
             ),
             style="Dim.TLabel",
             wraplength=300,
         ).pack(anchor="w", padx=6, pady=2)
         self.v_opt_rays = tk.IntVar(value=2500)
         self.v_opt_evals = tk.IntVar(value=80)
-        self.v_opt_uni_w = tk.DoubleVar(value=0.35)
+        self.v_opt_uni_w = tk.DoubleVar(value=0.9)
         self.v_opt_aspect_w = tk.DoubleVar(value=1.5)
-        self.v_opt_fill_w = tk.DoubleVar(value=1.5)
+        self.v_opt_fill_w = tk.DoubleVar(value=2.0)
         self.v_opt_two_phase = tk.BooleanVar(value=True)
         self.v_opt_extra = tk.IntVar(value=2)
         self.v_opt_ana_mode = tk.StringVar(value="crossed")
@@ -1077,13 +1077,13 @@ class OptiFluxApp(tk.Tk):
         self.v_opt_polish = tk.BooleanVar(value=True)
         self._add_slider(optz, "Rays per evaluation", self.v_opt_rays, 500, 15000, 500, True)
         self._add_slider(optz, "Max evaluations (approx.)", self.v_opt_evals, 20, 300, 10, True)
-        self._add_slider(optz, "Uniformity weight", self.v_opt_uni_w, 0.0, 2.0, 0.05)
+        self._add_slider(optz, "Uniformity weight (even rectangle)", self.v_opt_uni_w, 0.0, 3.0, 0.05)
         self._add_slider(
             optz,
             "FOV-fill weight (size match; under-fill hurts)",
             self.v_opt_fill_w,
             0.0,
-            4.0,
+            5.0,
             0.1,
         )
         self._add_slider(optz, "Aspect-match weight (phase 2)", self.v_opt_aspect_w, 0.0, 4.0, 0.1)
@@ -1094,10 +1094,10 @@ class OptiFluxApp(tk.Tk):
         ).pack(anchor="w", padx=6)
         self._add_slider(
             optz,
-            "Extra anamorphic lenses (phase 2)",
+            "Extra lenses (phase 2) · 2=cyl pair, 3–4=+relay",
             self.v_opt_extra,
             0,
-            2,
+            4,
             1,
             True,
         )
@@ -1275,6 +1275,13 @@ class OptiFluxApp(tk.Tk):
         return p
 
     def _on_param_change(self, *_):
+        # Immediately refresh lens *geometry* in the side view so curvature /
+        # thickness / aperture edits are visible before the next Trace finishes.
+        if self.result is not None and self._drag is None and not self._running:
+            try:
+                self._draw_side()
+            except Exception:
+                pass
         if not self.auto_run.get():
             return
         if self._debounce_id is not None:
@@ -1629,10 +1636,12 @@ class OptiFluxApp(tk.Tk):
         self, z: float, y: float
     ) -> Optional[tuple]:
         """
-        Return (handle_dict, mode) where mode is 'move' or 'resize'.
+        Return (handle_dict, mode) where mode is one of:
+          'move' | 'resize' | 'radius_front' | 'radius_rear'
 
-        Top/bottom rim near ±aperture → resize clear aperture.
-        Centre handle / body → move along Z.
+        Front/rear vertex (near axis) → radius of that surface.
+        Top/bottom rim → clear aperture.
+        Centre body → move along Z (other elements stay fixed).
         """
         if not self._element_handles:
             return None
@@ -1651,12 +1660,29 @@ class OptiFluxApp(tk.Tk):
                 y_top = max(ys) + ap
                 y_bot = min(ys) - ap
             y_lim = max(abs(y_top), abs(y_bot)) * 1.15
-            in_z = (zf - 2.0) <= z <= (zr + 2.0)
-            # Distance to top / bottom resize grips (prefer these when close)
+            in_z = (zf - 2.5) <= z <= (zr + 2.5)
+
+            # Radius handles: near optical axis at front / rear vertices
+            # Prefer these when |y| is small so body-move does not steal the grab.
+            rad_hit = max(1.4, 0.12 * ap)
+            if abs(y) <= rad_hit * 1.35:
+                d_front = math.hypot(z - zf, y)
+                d_rear = math.hypot(z - zr, y)
+                if d_front <= rad_hit and d_front < best_d:
+                    best_d = d_front
+                    best = h
+                    best_mode = "radius_front"
+                if d_rear <= rad_hit and d_rear < best_d:
+                    best_d = d_rear
+                    best = h
+                    best_mode = "radius_rear"
+                if best is h and best_mode.startswith("radius"):
+                    continue
+
+            # Distance to top / bottom resize grips
             d_top = math.hypot(z - z_mid, y - y_top)
             d_bot = math.hypot(z - z_mid, y - y_bot)
             d_edge = min(d_top, d_bot)
-            # Also accept near the rim anywhere along the element thickness
             if in_z:
                 d_edge = min(d_edge, abs(y - y_top), abs(y - y_bot))
             edge_hit_r = max(1.2, 0.18 * ap, 0.08 * max(zr - zf, 1.0))
@@ -1668,7 +1694,7 @@ class OptiFluxApp(tk.Tk):
                 continue
             # Body / centre → move
             if in_z and abs(y) <= y_lim:
-                d = abs(z - z_mid) + 0.15 * abs(y)  # prefer centre
+                d = abs(z - z_mid) + 0.15 * abs(y)
                 if d < best_d:
                     best_d = d
                     best = h
@@ -1702,6 +1728,7 @@ class OptiFluxApp(tk.Tk):
         self.status_var.set(f"Element {elem_index + 1} semi-aperture → {ap:.2f} mm")
 
     def _clamp_element_front_z(self, elem_index: int, new_front: float) -> float:
+        """Clamp so this element does not overlap neighbours; others stay put."""
         p = self.collect_params()
         layout = self._element_layout(p)
         by_idx = {h["index"]: h for h in layout}
@@ -1713,33 +1740,102 @@ class OptiFluxApp(tk.Tk):
         target_z = float(p["target_z"])
         z_min = source_z + 0.3
         z_max = target_z - thick - 0.5
-        prev = None
-        for item in layout:
-            if item["index"] == elem_index:
-                break
-            prev = item
-        if prev is not None:
-            z_min = max(z_min, prev["rear_z"] + 0.2)
+        enabled = [item for item in layout]
+        pos = next((i for i, item in enumerate(enabled) if item["index"] == elem_index), None)
+        if pos is None:
+            return new_front
+        if pos > 0:
+            z_min = max(z_min, enabled[pos - 1]["rear_z"] + 0.2)
+        if pos + 1 < len(enabled):
+            # Keep a minimum air gap before the next element (which stays fixed)
+            z_max = min(z_max, enabled[pos + 1]["front_z"] - thick - 0.2)
+        if z_max < z_min:
+            z_max = z_min
         return max(z_min, min(z_max, new_front))
 
     def _apply_element_front_z(self, elem_index: int, new_front: float) -> None:
+        """
+        Move one element in Z without shifting the others.
+
+        Stack spacing is still stored as lens_z_start + air_after chain, but
+        when element i moves we compensate air_after of i so element i+1 keeps
+        its absolute front Z.
+        """
         new_front = self._clamp_element_front_z(elem_index, new_front)
         layout = self._element_layout()
-        enabled_indices = [h["index"] for h in layout]
+        enabled = list(layout)
+        enabled_indices = [h["index"] for h in enabled]
         if elem_index not in enabled_indices:
             return
         pos = enabled_indices.index(elem_index)
+        h = enabled[pos]
+        old_front = float(h["front_z"])
+        thick = float(h["thickness"])
+        # Absolute front of the next enabled element (held fixed)
+        next_front = None
+        if pos + 1 < len(enabled):
+            next_front = float(enabled[pos + 1]["front_z"])
+
         if pos == 0:
             self.v_lens_z.set(round(new_front, 3))
         else:
             prev_idx = enabled_indices[pos - 1]
             prev_ev = self.elem_vars[prev_idx]
-            prev_front = next(h["front_z"] for h in layout if h["index"] == prev_idx)
-            prev_thick = float(prev_ev["thickness"].get())
-            prev_rear = prev_front + prev_thick
-            air = max(0.05, new_front - prev_rear)
-            prev_ev["air_after"].set(round(air, 3))
-        self.status_var.set(f"Moved element {elem_index + 1} front → Z = {new_front:.2f} mm")
+            prev_h = enabled[pos - 1]
+            prev_rear = float(prev_h["rear_z"])
+            air_before = max(0.05, new_front - prev_rear)
+            prev_ev["air_after"].set(round(air_before, 3))
+
+        # Compensate this element's air_after so the next stays put
+        if next_front is not None:
+            air_after = max(0.05, next_front - (new_front + thick))
+            self.elem_vars[elem_index]["air_after"].set(round(air_after, 3))
+
+        self.status_var.set(
+            f"Moved element {elem_index + 1} front → Z = {new_front:.2f} mm "
+            f"(neighbours held fixed)"
+        )
+
+    def _apply_element_radius(self, elem_index: int, which: str, new_R: float) -> None:
+        """Set R1 (front) or R2 (rear). which is 'front' or 'rear'."""
+        if elem_index < 0 or elem_index >= len(self.elem_vars):
+            return
+        ev = self.elem_vars[elem_index]
+        R = float(new_R)
+        # Keep |R| in a practical range; allow plano via large |R| ≈ 0 set as 0
+        if abs(R) < 0.5:
+            R = 0.0
+        else:
+            R = max(-500.0, min(500.0, R))
+        key = "R1" if which == "front" else "R2"
+        ev[key].set(round(R, 3))
+        # Keep anamorphic Y radius in step when not using independent Y controls
+        mode = str(ev["surface_mode"].get())
+        if mode == "rotational":
+            ykey = "R1y" if which == "front" else "R2y"
+            if ykey in ev:
+                ev[ykey].set(round(R, 3))
+        self.status_var.set(f"Element {elem_index + 1} {key} → {R:.2f} mm")
+
+    @staticmethod
+    def _radius_from_vertex_drag(
+        ap: float, rim_z: float, vertex_z: float, sign_hint: float
+    ) -> float:
+        """
+        Sphere radius from axial vertex Z and fixed rim Z.
+        sag = rim_z - vertex_z; R = (ap² + sag²) / (2 sag) with sign.
+        """
+        sag = float(rim_z) - float(vertex_z)
+        ap = max(float(ap), 0.5)
+        if abs(sag) < 1e-4:
+            # Nearly plano
+            return 0.0
+        R = (ap * ap + sag * sag) / (2.0 * sag)
+        # Prefer continuity with previous sign when |sag| is tiny near flip
+        if sign_hint != 0.0 and abs(R) > 1e-6:
+            if R * sign_hint < 0 and abs(sag) < 0.05:
+                R = -R
+        return max(-500.0, min(500.0, R))
 
     def _on_side_press(self, event):
         if event.inaxes != self.ax_side:
@@ -1767,28 +1863,62 @@ class OptiFluxApp(tk.Tk):
         if picked is None:
             return
         hit, mode = picked
+        idx = int(hit["index"])
+        ev = self.elem_vars[idx] if 0 <= idx < len(self.elem_vars) else None
+        R1 = float(ev["R1"].get()) if ev else 0.0
+        R2 = float(ev["R2"].get()) if ev else 0.0
+        ap = float(hit["aperture"])
+        zf, zr = float(hit["front_z"]), float(hit["rear_z"])
+        # Rim Z from current radius (sag at aperture) — held fixed while vertex moves
+        def _rim_z(z_vertex: float, R: float) -> float:
+            if abs(R) < 1e-9:
+                return z_vertex
+            c = 1.0 / R
+            r2 = ap * ap
+            disc = 1.0 - c * c * r2
+            if disc < 0:
+                return z_vertex
+            sag = (c * r2) / (1.0 + math.sqrt(max(0.0, disc)))
+            return z_vertex + sag
+
         self._drag = {
             "mode": mode,
-            "elem_index": hit["index"],
+            "elem_index": idx,
             "label": hit["label"],
-            "orig_front": hit["front_z"],
+            "orig_front": zf,
             "press_z": float(event.xdata),
             "press_y": float(event.ydata),
-            "current_front": hit["front_z"],
-            "aperture": hit["aperture"],
-            "orig_aperture": hit["aperture"],
-            "current_aperture": hit["aperture"],
+            "current_front": zf,
+            "aperture": ap,
+            "orig_aperture": ap,
+            "current_aperture": ap,
             "thickness": hit["thickness"],
+            "orig_R1": R1,
+            "orig_R2": R2,
+            "current_R1": R1,
+            "current_R2": R2,
+            "rim_front_z": _rim_z(zf, R1),
+            "rim_rear_z": _rim_z(zr, R2),
         }
         if mode == "resize":
             self.canvas_side.get_tk_widget().configure(cursor="sb_v_double_arrow")
             self.status_var.set(
-                f"Resizing {hit['label']}  ·  semi-aperture = {hit['aperture']:.2f} mm  ·  release to re-trace"
+                f"Resizing {hit['label']}  ·  semi-aperture = {ap:.2f} mm  ·  release to re-trace"
+            )
+        elif mode == "radius_front":
+            self.canvas_side.get_tk_widget().configure(cursor="sb_h_double_arrow")
+            self.status_var.set(
+                f"Front radius {hit['label']}  ·  R₁ = {R1:.2f} mm  ·  drag vertex · release to re-trace"
+            )
+        elif mode == "radius_rear":
+            self.canvas_side.get_tk_widget().configure(cursor="sb_h_double_arrow")
+            self.status_var.set(
+                f"Rear radius {hit['label']}  ·  R₂ = {R2:.2f} mm  ·  drag vertex · release to re-trace"
             )
         else:
             self.canvas_side.get_tk_widget().configure(cursor="sb_h_double_arrow")
             self.status_var.set(
-                f"Dragging {hit['label']}  ·  release to re-trace  ·  Z = {hit['front_z']:.2f} mm"
+                f"Dragging {hit['label']}  ·  Z = {zf:.2f} mm  ·  neighbours stay fixed"
             )
 
     def _on_side_motion(self, event):
@@ -1822,6 +1952,8 @@ class OptiFluxApp(tk.Tk):
                     cur = "hand2"
                 elif picked[1] == "resize":
                     cur = "sb_v_double_arrow"
+                elif picked[1] in ("radius_front", "radius_rear"):
+                    cur = "sb_h_double_arrow"
                 else:
                     cur = "sb_h_double_arrow"
                 self.canvas_side.get_tk_widget().configure(cursor=cur)
@@ -1832,12 +1964,40 @@ class OptiFluxApp(tk.Tk):
         if mode == "resize":
             if event.ydata is None:
                 return
-            # Semi-aperture = |Y| from optical axis (top or bottom drag)
             new_ap = max(1.0, min(50.0, abs(float(event.ydata))))
             self._drag["current_aperture"] = new_ap
             self.status_var.set(
                 f"Resizing {self._drag['label']}  ·  semi-aperture = {new_ap:.2f} mm  ·  release to re-trace"
             )
+            self._draw_side()
+            return
+        if mode in ("radius_front", "radius_rear"):
+            if event.xdata is None:
+                return
+            ap = float(self._drag["aperture"])
+            if mode == "radius_front":
+                rim_z = float(self._drag["rim_front_z"])
+                sign_hint = float(self._drag.get("orig_R1", 0.0))
+                new_R = self._radius_from_vertex_drag(
+                    ap, rim_z, float(event.xdata), sign_hint
+                )
+                self._drag["current_R1"] = new_R
+                # Live UI update so side-view geometry rebuilds with new R
+                self._apply_element_radius(self._drag["elem_index"], "front", new_R)
+                self.status_var.set(
+                    f"Front radius {self._drag['label']}  ·  R₁ = {new_R:.2f} mm  ·  release to re-trace"
+                )
+            else:
+                rim_z = float(self._drag["rim_rear_z"])
+                sign_hint = float(self._drag.get("orig_R2", 0.0))
+                new_R = self._radius_from_vertex_drag(
+                    ap, rim_z, float(event.xdata), sign_hint
+                )
+                self._drag["current_R2"] = new_R
+                self._apply_element_radius(self._drag["elem_index"], "rear", new_R)
+                self.status_var.set(
+                    f"Rear radius {self._drag['label']}  ·  R₂ = {new_R:.2f} mm  ·  release to re-trace"
+                )
             self._draw_side()
             return
         if event.xdata is None:
@@ -1848,7 +2008,7 @@ class OptiFluxApp(tk.Tk):
         )
         self._drag["current_front"] = new_front
         self.status_var.set(
-            f"Dragging {self._drag['label']}  ·  Z = {new_front:.2f} mm  ·  release to re-trace"
+            f"Dragging {self._drag['label']}  ·  Z = {new_front:.2f} mm  ·  neighbours stay fixed"
         )
         self._draw_side()
 
@@ -1875,6 +2035,26 @@ class OptiFluxApp(tk.Tk):
                 self._debounce_id = None
             self.status_var.set(
                 f"{drag['label']} semi-aperture = {new_ap:.2f} mm — tracing…"
+            )
+            self.run_trace()
+            return
+        if mode in ("radius_front", "radius_rear"):
+            which = "front" if mode == "radius_front" else "rear"
+            key = "current_R1" if which == "front" else "current_R2"
+            orig_key = "orig_R1" if which == "front" else "orig_R2"
+            new_R = float(drag.get(key, drag.get(orig_key, 0.0)))
+            orig_R = float(drag.get(orig_key, 0.0))
+            if abs(new_R - orig_R) < 1e-3:
+                self.status_var.set("Ready")
+                self._draw_side()
+                return
+            # Already applied live during motion; just re-trace
+            if self._debounce_id is not None:
+                self.after_cancel(self._debounce_id)
+                self._debounce_id = None
+            rlabel = "R₁" if which == "front" else "R₂"
+            self.status_var.set(
+                f"{drag['label']} {rlabel} = {new_R:.2f} mm — tracing…"
             )
             self.run_trace()
             return
@@ -2107,8 +2287,25 @@ class OptiFluxApp(tk.Tk):
             if drag_mode == "resize":
                 drag_ap = float(self._drag.get("current_aperture", self._drag["orig_aperture"]))
 
-        pairs = self._surface_pairs(res.surfaces)
-        mla_mode = any(s.label.startswith("MLA") for s in res.surfaces)
+        # Lens bodies follow *current* UI params (live curvature), not the last
+        # Trace. Rays still come from res.paths.
+        try:
+            from engine import build_source_array, build_surfaces
+
+            live_dies = build_source_array(p["source"])
+            mla_p = p.get("mla") or {}
+            live_surfs = build_surfaces(
+                p["elements"],
+                float(p["lens_z_start"]),
+                mla_p if mla_p.get("enabled") else None,
+                live_dies if mla_p.get("enabled") else None,
+            )
+            if not live_surfs:
+                live_surfs = res.surfaces
+        except Exception:
+            live_surfs = res.surfaces
+        pairs = self._surface_pairs(live_surfs)
+        mla_mode = any(s.label.startswith("MLA") for s in live_surfs)
 
         y_ext = 12.0
         for d in res.dies:
@@ -2198,6 +2395,8 @@ class OptiFluxApp(tk.Tk):
             active = drag_idx is not None and h["index"] == drag_idx
             resizing = active and drag_mode == "resize"
             moving = active and drag_mode == "move"
+            rad_front = active and drag_mode == "radius_front"
+            rad_rear = active and drag_mode == "radius_rear"
             z_handle = 0.5 * (zf + zr)
             # Vertical dashed centre line (move)
             ax.plot(
@@ -2219,6 +2418,23 @@ class OptiFluxApp(tk.Tk):
                 zorder=7,
                 markeredgecolor="#0b0f14",
             )
+            # Front / rear vertex radius handles (on axis)
+            y_ax = 0.0 if not (mla_mode and h["index"] == 0) else 0.5 * (y_lo + y_hi)
+            for z_v, active_r, label_r in (
+                (zf, rad_front, "R1"),
+                (zr, rad_rear, "R2"),
+            ):
+                ax.plot(
+                    z_v,
+                    y_ax,
+                    "o",
+                    color="#a78bfa" if active_r else "#c4b5fd",
+                    ms=8 if active_r else 6,
+                    zorder=9,
+                    markeredgecolor="#0b0f14",
+                    markeredgewidth=0.7,
+                    alpha=0.95,
+                )
             # Top / bottom resize grips
             grip_col = "#38bdf8" if resizing else "#64748b"
             for yg in (y_top_grip, y_bot_grip):
@@ -2745,14 +2961,14 @@ class OptiFluxApp(tk.Tk):
 
         params = self.collect_params()
         two_phase = bool(self.v_opt_two_phase.get())
-        extra = int(self.v_opt_extra.get())
+        extra = max(0, min(4, int(self.v_opt_extra.get())))
         cfg = OptimizeConfig(
             rays_per_eval=int(self.v_opt_rays.get()),
             max_evals=int(self.v_opt_evals.get()),
             uniformity_weight=float(self.v_opt_uni_w.get()),
             aspect_weight=float(self.v_opt_aspect_w.get()),
             fill_weight=float(self.v_opt_fill_w.get()),
-            coverage_mix=0.75,
+            coverage_mix=0.9,
             two_phase=two_phase,
             extra_anamorphic_lenses=extra,
             anamorphic_mode=str(self.v_opt_ana_mode.get() or "crossed"),

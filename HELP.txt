@@ -230,9 +230,11 @@ VIEWS
 --------------------------------------------------------------------------
 
 Side view (Y–Z)
-  Cross-section along the optical axis. Scroll to zoom; right-drag to pan;
-  left-drag the centre handle (yellow square) to move a lens along Z;
-  left-drag the top or bottom diamond grips to change clear semi-aperture.
+  Cross-section along the optical axis. Scroll to zoom; right-drag to pan.
+  Handles on each lens:
+    • Yellow centre square — move that lens along Z (neighbours stay fixed)
+    • Purple dots on front/rear vertices — drag to set R₁ / R₂
+    • Top/bottom diamonds — clear semi-aperture
   Release the mouse to re-trace.
 
 Target plane (X–Y)

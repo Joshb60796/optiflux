@@ -6,7 +6,7 @@ lens radii, thicknesses, air gaps, apertures, and first-vertex Z.
 
 Optional **two-phase rectangular** mode:
   Phase 1 — even illumination in the FOV (flux + uniformity; circular OK)
-  Phase 2 — inject 1–2 anamorphic elements (crossed cylinders or biconic) and
+  Phase 2 — inject 1–4 elements (crossed cylinders, optional relay/biconic) and
             match footprint aspect σx/σy to the FOV width/height ratio
 
 Uses SciPy differential evolution + optional Nelder–Mead polish.
@@ -47,18 +47,19 @@ class OptimizeConfig:
     # Local polish after DE
     polish: bool = True
     polish_maxiter: int = 40
-    # Objective prioritizes *filling* the rectangular FOV, not a small hot-spot:
-    #   score = fov_flux * (0.25 + 0.75*coverage) * (1 + w_u*uni)
+    # Objective prioritizes a *bright, even rectangular* FOV fill:
+    #   score ∝ fov_flux × coverage × profile_fill × uniformity
     #           / (1 + w_a*aspect_error) / (1 + w_s*size_error)
-    uniformity_weight: float = 0.25
+    # A small hot-spot can no longer beat a filled rectangle on flux alone.
+    uniformity_weight: float = 0.8  # multiplies into uniformity term
     aspect_weight: float = 0.0  # 0 → ignore footprint aspect (circular OK)
-    fill_weight: float = 1.5  # weight on size_error (under-fill of FOV)
-    coverage_mix: float = 0.75  # how hard to require FOV bin coverage (0–1)
+    fill_weight: float = 2.0  # weight on size_error (under-fill of FOV)
+    coverage_mix: float = 0.9  # how hard to require FOV bin / profile fill (0–1)
     # Two-phase rectangular FOV design:
     #   Phase 1 — rotational (or current) optics → even light in FOV
     #   Phase 2 — add N anamorphic lenses → reshape footprint to FOV W/H
     two_phase: bool = False
-    extra_anamorphic_lenses: int = 2  # 0, 1, or 2 additional elements in phase 2
+    extra_anamorphic_lenses: int = 2  # 0–4 additional elements in phase 2
     anamorphic_mode: str = "crossed"  # "crossed" | "biconic"
     phase1_eval_fraction: float = 0.45  # share of max_evals for phase 1
     # Which free variables to include
@@ -369,7 +370,8 @@ def inject_anamorphic_lenses(
     from materials_catalog import material_name_from_id
 
     p = copy.deepcopy(params)
-    n_extra = max(0, min(int(n_extra), 2))
+    # Up to 4 extra slots (collector + 4 = 5 = MAX_ELEMENTS)
+    n_extra = max(0, min(int(n_extra), 4))
     if n_extra < 1:
         return p
 
@@ -398,8 +400,9 @@ def inject_anamorphic_lenses(
     target_z = float(p.get("target_z", 80.0))
     lens_z = float(p.get("lens_z_start", 3.0))
     z_cursor = lens_z + float(e0.get("thickness", 0)) + float(e0.get("air_after", 0))
+    ap0 = float(e0.get("aperture", 12.0))
+    t0 = max(3.0, float(e0.get("thickness", 4.0)) * 0.7)
 
-    use_crossed = mode.lower().startswith("cross") and n_extra >= 2
     kwargs = dict(
         fov_width=fov_w,
         fov_height=fov_h,
@@ -408,33 +411,80 @@ def inject_anamorphic_lenses(
         source_z=float(src.get("source_z", 0.0)),
         material=mat,
         wavelength_nm=float(src.get("wavelength_nm", 550.0)),
-        aperture=float(e0.get("aperture", 12.0)),
-        thickness=max(3.0, float(e0.get("thickness", 4.0)) * 0.7),
+        aperture=ap0,
+        thickness=t0,
         custom_n=float(p.get("custom_n", 1.5)),
     )
 
-    if use_crossed:
+    seeds: List[Dict[str, Any]] = []
+    prefer_crossed = mode.lower().startswith("cross")
+
+    if n_extra == 1 and not prefer_crossed:
+        design = design_biconic_singlet_for_rect_fov(
+            **{
+                k: kwargs[k]
+                for k in (
+                    "fov_width",
+                    "fov_height",
+                    "target_z",
+                    "lens_z_start",
+                    "source_z",
+                    "material",
+                    "wavelength_nm",
+                    "aperture",
+                    "thickness",
+                    "custom_n",
+                )
+            }
+        )
+        seeds = [design["elements"][0]]
+    else:
+        # Crossed cylinders form the rectangular core; further slots add a
+        # mild spherical relay / field element to improve FOV evenness.
         design = design_crossed_cylinders_for_rect_fov(**kwargs)
         seeds = [design["elements"][0], design["elements"][1]]
-    else:
-        design = design_biconic_singlet_for_rect_fov(**{
-            k: kwargs[k]
-            for k in (
-                "fov_width",
-                "fov_height",
-                "target_z",
-                "lens_z_start",
-                "source_z",
-                "material",
-                "wavelength_nm",
-                "aperture",
-                "thickness",
-                "custom_n",
+        if n_extra >= 3:
+            # Weak positive relay — helps homogenize without dominating power
+            seeds.append(
+                {
+                    "enabled": True,
+                    "shape_id": "custom",
+                    "surface_mode": "rotational",
+                    "R1": max(40.0, ap0 * 4.0),
+                    "R2": -max(40.0, ap0 * 4.0),
+                    "R1y": None,
+                    "R2y": None,
+                    "thickness": max(2.5, t0 * 0.6),
+                    "air_after": 1.5,
+                    "aperture": ap0,
+                    "aperture_y": None,
+                    "material": mat,
+                    "k1": 0.0,
+                    "k2": 0.0,
+                    "A4_1": 0.0,
+                    "A4_2": 0.0,
+                }
             )
-        })
-        seeds = [design["elements"][0]]
-        # n_extra>=2 with biconic: only one anamorphic singlet (no weak relay —
-        # extra surfaces mostly cost Fresnel without helping FOV flux)
+        if n_extra >= 4:
+            design_b = design_biconic_singlet_for_rect_fov(
+                **{
+                    k: kwargs[k]
+                    for k in (
+                        "fov_width",
+                        "fov_height",
+                        "target_z",
+                        "lens_z_start",
+                        "source_z",
+                        "material",
+                        "wavelength_nm",
+                        "aperture",
+                        "thickness",
+                        "custom_n",
+                    )
+                }
+            )
+            seeds.append(design_b["elements"][0])
+        seeds = seeds[:n_extra]
 
     # Only use free (disabled) slots after the collector — never grow past
     # collector + len(seeds) enabled elements.
@@ -514,11 +564,16 @@ def evaluate_fov_flux(
     # Line-cut fill (X & Y profiles through FOV centre) — matches the profile plot
     profile_fill = float(fov.get("profile_fill", coverage))
 
-    # Mix coverage + profile fill so a small central hot-spot cannot "win"
-    # solely by concentrating power in a few FOV bins.
+    # Require *area* fill + *line-cut* fill + *evenness*. A thin bright streak
+    # through FOV centre scores high on flux but low on coverage/uniformity.
     mix = min(1.0, max(0.0, float(cfg.coverage_mix)))
-    fill_factor = (1.0 - mix) + mix * (0.5 * coverage + 0.5 * profile_fill)
-    score = fov_flux * fill_factor * (1.0 + float(cfg.uniformity_weight) * uniformity)
+    area_fill = 0.5 * coverage + 0.5 * profile_fill
+    fill_factor = (1.0 - mix) + mix * area_fill
+    # Uniformity is Emin/Emax over lit FOV bins — multiplicative so 10% uniform
+    # cannot be rescued by a high flux term alone.
+    w_u = max(0.0, float(cfg.uniformity_weight))
+    uni_factor = (0.15 + 0.85 * uniformity) ** max(0.5, min(2.0, 0.5 + w_u))
+    score = fov_flux * fill_factor * uni_factor
     w_a = float(cfg.aspect_weight)
     if w_a > 0:
         score = score / (1.0 + w_a * aspect_error)
@@ -528,11 +583,12 @@ def evaluate_fov_flux(
     # Landscape FOV must not keep a portrait beam (and vice versa).
     if orientation_flipped > 0.5:
         score *= 0.35
-    # Mild complexity cost: each enabled element adds surfaces/Fresnel. Prefer
-    # simpler stacks when FOV flux is otherwise similar.
+    # Mild complexity cost. Softer when the user explicitly asked for many
+    # extra anamorphic elements (phase-2 stacks of 3–4).
     n_en = sum(1 for e in p.get("elements", []) if e.get("enabled", True))
     if n_en > 1:
-        score = score / (1.0 + 0.04 * (n_en - 1))
+        soft = 0.02 if int(getattr(cfg, "extra_anamorphic_lenses", 0) or 0) >= 3 else 0.04
+        score = score / (1.0 + soft * (n_en - 1))
     score -= _geometry_penalty(p, cfg.penalty_scale)
     return score, fov_flux, uniformity, collection, aspect_error, footprint_aspect
 
@@ -897,7 +953,7 @@ def _cli() -> int:
         "--extra-lenses",
         type=int,
         default=2,
-        help="Anamorphic elements to add in phase 2 (0–2)",
+        help="Extra elements to add in phase 2 (0–4; 2=crossed pair, 3–4=+relay)",
     )
     ap.add_argument(
         "--anamorphic",
@@ -916,7 +972,7 @@ def _cli() -> int:
         uniformity_weight=args.uniformity_weight,
         aspect_weight=args.aspect_weight,
         two_phase=bool(args.two_phase),
-        extra_anamorphic_lenses=max(0, min(2, args.extra_lenses)),
+        extra_anamorphic_lenses=max(0, min(4, args.extra_lenses)),
         anamorphic_mode=args.anamorphic,
         seed=args.seed,
         polish=not args.no_polish,

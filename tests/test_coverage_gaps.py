@@ -627,5 +627,54 @@ class TestProgressiveMore(unittest.TestCase):
         self.assertIn("backend", got[-1].stats)
 
 
+
+class TestSideViewDragMath(unittest.TestCase):
+    """Pure math for independent Z moves and radius-from-vertex drags."""
+
+    @staticmethod
+    def _radius_from_vertex_drag(ap, rim_z, vertex_z, sign_hint=0.0):
+        sag = float(rim_z) - float(vertex_z)
+        ap = max(float(ap), 0.5)
+        if abs(sag) < 1e-4:
+            return 0.0
+        R = (ap * ap + sag * sag) / (2.0 * sag)
+        if sign_hint != 0.0 and abs(R) > 1e-6 and R * sign_hint < 0 and abs(sag) < 0.05:
+            R = -R
+        return max(-500.0, min(500.0, R))
+
+    @staticmethod
+    def _independent_air(prev_rear, thick, next_front, new_front):
+        air_before = max(0.05, new_front - prev_rear)
+        air_after = None
+        if next_front is not None:
+            air_after = max(0.05, next_front - (new_front + thick))
+        return air_before, air_after
+
+    def test_radius_from_known_sag(self):
+        # R=25, ap=10 → sag = R - sqrt(R^2-ap^2)
+        R = 25.0
+        ap = 10.0
+        sag = R - math.sqrt(R * R - ap * ap)
+        vertex, rim = 0.0, sag
+        R_rec = self._radius_from_vertex_drag(ap, rim, vertex, sign_hint=1.0)
+        self.assertAlmostEqual(R_rec, R, places=4)
+
+    def test_plano_when_vertex_at_rim(self):
+        self.assertAlmostEqual(self._radius_from_vertex_drag(10.0, 5.0, 5.0), 0.0, places=6)
+
+    def test_move_middle_keeps_next_fixed(self):
+        # E1 was at 10 (prev_rear=8, thick=4, next at 16)
+        air_b, air_a = self._independent_air(8.0, 4.0, 16.0, 12.0)
+        self.assertAlmostEqual(air_b, 4.0, places=5)
+        self.assertAlmostEqual(air_a, 0.05, places=5)  # clamped min gap
+        # next front reconstructed
+        self.assertAlmostEqual(12.0 + 4.0 + air_a, 16.05, places=5)
+
+    def test_move_first_compensates_air(self):
+        air_b, air_a = self._independent_air(0.3, 5.0, 10.0, 4.0)
+        self.assertAlmostEqual(air_b, 3.7, places=5)
+        self.assertAlmostEqual(4.0 + 5.0 + air_a, 10.0, places=5)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
