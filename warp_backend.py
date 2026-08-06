@@ -64,14 +64,18 @@ if _WARP_AVAILABLE:
         k_y: float
         a4: float
         a4_y: float
-        aperture: float        # ap_x
-        aperture_y: float      # ap_y (same → circular)
+        aperture: float        # ap_x / outer semi-size
+        aperture_y: float      # ap_y (same → circular when shape=circle)
         x0: float
         y0: float
         n_before: float
         n_after: float
         mode: int              # 0=rotational, 1=biconic, 2=cyl_x, 3=cyl_y
         active: int
+        interaction: int       # 0=refract, 1=absorb
+        aperture_shape: int    # 0=circle/ellipse, 1=rect
+        inner_aperture: float  # hole semi-x; 0 = solid
+        inner_aperture_y: float
 
     @wp.struct
     class WRay:
@@ -129,10 +133,34 @@ if _WARP_AVAILABLE:
         return z
 
     @wp.func
-    def in_aperture(lx: float, ly: float, apx: float, apy: float) -> int:
-        if apy < 1.0e-12:  # circular
-            return 1 if (lx * lx + ly * ly) <= (apx * apx + 1.0e-9) else 0
-        return 1 if ((lx / apx) * (lx / apx) + (ly / apy) * (ly / apy)) <= 1.0 + 1.0e-9 else 0
+    def in_region(lx: float, ly: float, apx: float, apy: float, shape: int) -> int:
+        """Outer/hole region test. shape: 0=circle/ellipse, 1=rect."""
+        ax = float(wp.max(apx, 1.0e-12))
+        if shape == 1:
+            ay = float(wp.max(apy, 1.0e-12))
+            return 1 if (wp.abs(lx) <= ax + 1.0e-9 and wp.abs(ly) <= ay + 1.0e-9) else 0
+        if apy < 1.0e-12 or wp.abs(apy - ax) < 1.0e-12:
+            return 1 if (lx * lx + ly * ly) <= (ax * ax + 1.0e-9) else 0
+        ay = float(wp.max(apy, 1.0e-12))
+        return 1 if ((lx / ax) * (lx / ax) + (ly / ay) * (ly / ay)) <= 1.0 + 1.0e-9 else 0
+
+    @wp.func
+    def in_hit_region(
+        lx: float,
+        ly: float,
+        apx: float,
+        apy: float,
+        shape: int,
+        interaction: int,
+        inn_x: float,
+        inn_y: float,
+    ) -> int:
+        if in_region(lx, ly, apx, apy, shape) == 0:
+            return 0
+        if interaction == 1 and inn_x > 1.0e-12:
+            if in_region(lx, ly, inn_x, inn_y, shape) == 1:
+                return 0
+        return 1
 
     @wp.func
     def normal_at(
@@ -206,7 +234,10 @@ if _WARP_AVAILABLE:
         p = o + d * t
         lx = float(p[0] - s.x0)
         ly = float(p[1] - s.y0)
-        if in_aperture(lx, ly, s.aperture, s.aperture_y) == 0:
+        if in_hit_region(
+            lx, ly, s.aperture, s.aperture_y, s.aperture_shape,
+            s.interaction, s.inner_aperture, s.inner_aperture_y,
+        ) == 0:
             return wp.vec4(-1.0, 0.0, 0.0, 0.0)
         return wp.vec4(t, p[0], p[1], p[2])
 
@@ -339,6 +370,11 @@ if _WARP_AVAILABLE:
 
             # interact with surface
             s = surfaces[best_i]
+            # Opaque absorb panel / aperture stop — kill before Snell
+            if s.interaction == 1:
+                rays[tid].alive = 0
+                return
+
             n1 = float(s.n_before)
             n2 = float(s.n_after)
             if wp.dot(d, best_n) > 0.0:
@@ -392,7 +428,21 @@ def _build_wsurf_list(surfaces, wavelength_nm: float, custom_n: float):
         n_b = refractive_index(s.material_before, wavelength_nm, custom_n)
         n_a = refractive_index(s.material_after, wavelength_nm, custom_n)
         ry = s.radius_y if s.radius_y is not None else s.radius
-        apy = s.aperture_y if s.aperture_y is not None else s.aperture
+        shape = str(getattr(s, "aperture_shape", "circle") or "circle").lower()
+        shape_i = 1 if shape == "rect" else 0
+        if s.aperture_y is not None and float(s.aperture_y) > 0:
+            apy = float(s.aperture_y)
+        elif shape_i == 1:
+            apy = float(s.aperture)
+        else:
+            apy = float(s.aperture)
+        inn = getattr(s, "inner_aperture", None)
+        inn_x = float(inn) if inn is not None and float(inn) > 0 else 0.0
+        inn_y_raw = getattr(s, "inner_aperture_y", None)
+        if inn_y_raw is not None and float(inn_y_raw) > 0:
+            inn_y = float(inn_y_raw)
+        else:
+            inn_y = inn_x
 
         ws = WSurf()
         ws.z_vertex = float(s.z_vertex)
@@ -410,6 +460,10 @@ def _build_wsurf_list(surfaces, wavelength_nm: float, custom_n: float):
         ws.n_after = float(n_a)
         ws.mode = _mode_to_int(s.mode)
         ws.active = 1 if s.active else 0
+        ws.interaction = 1 if getattr(s, "interaction", "refract") == "absorb" else 0
+        ws.aperture_shape = shape_i
+        ws.inner_aperture = inn_x
+        ws.inner_aperture_y = inn_y
         out.append(ws)
     return out
 

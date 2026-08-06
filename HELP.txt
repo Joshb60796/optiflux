@@ -14,8 +14,10 @@ Trace rays
   Run (or re-run) the ray-trace simulation with the current parameters.
 
 Optimize FOV
-  Search lens parameters to increase power inside the rectangular Field of
-  View (FOV). Uses a derivative-free optimizer (differential evolution).
+  Tunes the *current* enabled lens group (radii, thickness, air gaps,
+  apertures, Z) to improve FOV flux and uniformity. Does not add lenses or
+  force a rectangular reshape. For rectangular FOV design (coverage + min
+  spill, optional anamorphics), use the left-panel Optimizer section.
 
 Auto-run
   When checked, parameter changes schedule a new trace after a short delay.
@@ -29,6 +31,21 @@ Reset defaults
 
 Presets
   Quick starting points (single LED, COB arrays, rectangular FOV designs).
+
+Save / Load design
+  Header buttons: Design → Save… and Design → Load…
+  Saves the full configuration to a JSON file under the designs/ folder
+  (source, all lens elements, materials, FOV, MLA, blockers, ray counts).
+  Load restores every control and re-traces. Optional notes are stored
+  in the file and shown when loading.
+
+3D view
+  Header button: opens an interactive isometric 3D window of the source,
+  lens stack, absorbing blockers, target plane, and FOV outline. Optical
+  +Z (light) points to the right. Left-drag to rotate; right-drag to zoom
+  (matplotlib toolbar also available). Update refreshes after parameter
+  changes; sample ray paths appear when a trace has been run.
+
 
 Help
   Opens this document in a scrollable window.
@@ -176,13 +193,31 @@ Color partial lens rays (target)
 
 
 --------------------------------------------------------------------------
-OPTIMIZER
+LEFT PANEL (collapsible sections)
 --------------------------------------------------------------------------
 
+Source, Optics, Blockers, Target, Simulation, and Optimizer sections each
+have a ▶ / ▼ header. Click the triangle (or the header bar) to expand or
+collapse. All sections start collapsed when the program opens so the panel
+stays short; expand only what you need. A vertical scrollbar on the right
+edge of the panel scrolls the full list of sections.
+
+Lens Element 1…5 still collapse individually inside Optics (same as before).
+
+
+--------------------------------------------------------------------------
+OPTIMIZER (left panel · rectangular FOV)
+--------------------------------------------------------------------------
+
+Objective
+  Maximize even coverage of the rectangular FOV (flux × coverage ×
+  profile fill × uniformity) while minimizing light outside the FOV
+  (spill on the target plane and waste not in the FOV).
+
 Two-phase rectangular
-  Phase 1 improves flux/uniformity on the current stack. Phase 2 can add
-  one or two anamorphic elements to match FOV aspect, then keeps phase 1 if
-  the extras do not improve FOV flux.
+  Phase 1 improves even FOV fill on the current stack. Phase 2 can add
+  anamorphic elements to match FOV aspect, then keeps phase 1 if the
+  extras do not improve FOV flux.
 
 Extra anamorphic lenses
   0 = none; 1 = biconic singlet; 2 = crossed cylinders (X then Y).
@@ -226,16 +261,51 @@ EFL (element 1)
 
 
 --------------------------------------------------------------------------
+BLOCKERS (BODIES / TUBES / STOPS)
+--------------------------------------------------------------------------
+
+Left panel: BLOCKERS · absorbing panels / stops
+
+  Simulates light-absorbing enclosure walls (lens barrel, snoot, baffles)
+  and mechanical stops.
+
+  Add body (rect · horizontal) — default for rectangular panels
+    Four walls of a rectangular tube along +Z (top/bottom/left/right).
+    In the side view these appear as *horizontal* lines at ± half-height —
+    like a camera body or rectangular snoot. Rays inside the bore pass;
+    rays that hit a wall are absorbed.
+
+  Add tube (circle · tube) — default for circular shape
+    Circular cylinder along the optical axis (lens barrel / pipe / snoot).
+    Side view shows top and bottom generators as horizontal lines.
+    On-axis light through the bore is free; wall hits absorb.
+
+  Add stop (vertical / face-on)
+    Z-normal aperture stop or solid disk (iris). Appears as a vertical
+    slab in the side view. Optional central hole = open aperture.
+
+  Length along Z sets how long bodies/tubes are. Drag the red square to
+  move the center along Z.
+
+
+--------------------------------------------------------------------------
 VIEWS
 --------------------------------------------------------------------------
 
-Side view (Y–Z)
-  Cross-section along the optical axis. Scroll to zoom; right-drag to pan.
-  Handles on each lens:
+Side views (Y–Z and X–Z)
+  Two stacked meridional cuts share the Z axis:
+    • Top (Y–Z) — shows cylinder_y and rotational power in Y
+    • Bottom (X–Z) — orthogonal cut; shows cylinder_x and rotational power in X
+  Scroll to zoom; right-drag to pan. Handles on each lens:
     • Yellow centre square — move that lens along Z (neighbours stay fixed)
     • Purple dots on front/rear vertices — drag to set R₁ / R₂
     • Top/bottom diamonds — clear semi-aperture
+  Grey slabs = absorbing blockers (red square = Z drag).
   Release the mouse to re-trace.
+
+3D isometric view
+  Header “3D view” — source, lenses, blockers, target plane, FOV, and
+  sample rays in a rotatable 3D scene.
 
 Target plane (X–Y)
   Irradiance map at Target Z. Purple rectangle = FOV. White cross = power

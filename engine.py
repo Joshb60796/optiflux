@@ -175,6 +175,25 @@ class OpticalSurface:
     a4_y: float = 0.0
     mode: str = "rotational"  # rotational | biconic | cylinder_x | cylinder_y
     aperture_y: Optional[float] = None  # if set with aperture as ap_x → ellipse
+    # Interaction: "refract" (default lenses) or "absorb" (opaque blockers / stops)
+    interaction: str = "refract"
+    # Outer aperture shape for hit test: "circle" | "rect" (axis-aligned)
+    aperture_shape: str = "circle"
+    # Central hole (aperture stop). None / ≤0 → solid panel. Same shape family as outer.
+    inner_aperture: Optional[float] = None
+    inner_aperture_y: Optional[float] = None
+    # Display-only thickness (mm) for Z-facing stops; for baffles/tubes = axial length hint
+    display_thickness: float = 1.0
+    # Geometry for intersection (lenses use asphere sag; blockers use planes / tube)
+    #   asphere  — standard optical surface z = z_vertex + sag(x,y)
+    #   plane_z  — face-on stop: plane z = z_vertex (vertical in side view)
+    #   plane_y  — horizontal baffle: plane y = y0 + plane_offset
+    #   plane_x  — side baffle: plane x = x0 + plane_offset
+    #   cylinder_z — tube / pipe / lens barrel along optical +Z
+    geom: str = "asphere"
+    plane_offset: float = 0.0  # signed offset from x0/y0/z_vertex for plane_* geoms
+    # Half-length along optical Z for baffles & tubes (mm); full length = 2 * extent_z
+    extent_z: float = 10.0
 
     def curvature(self) -> float:
         return _curv(self.radius)
@@ -208,13 +227,16 @@ class OpticalSurface:
         """
         mode = self.mode
         if mode == "cylinder_x":
+            # Power in X only — both front and rear use self.radius (R1 / R2)
             cx, cy = _curv(self.radius), 0.0
             kx, ky = self.k, 0.0
             a4x, a4y = self.a4, 0.0
         elif mode == "cylinder_y":
+            # Power in Y only — prefer explicit radius_y, else self.radius (R1 / R2)
+            # so a biconvex cylinder has curved front AND rear when |R1| and |R2| ≠ 0
             Ry = self.radius_y if self.radius_y is not None else self.radius
             cx, cy = 0.0, _curv(Ry)
-            kx, ky = 0.0, self.k_y
+            kx, ky = 0.0, self.k_y if self.radius_y is not None else self.k
             a4x, a4y = 0.0, self.a4_y if abs(self.a4_y) > 0 else self.a4
         elif mode == "biconic" or self.is_anamorphic():
             cx = _curv(self.radius)
@@ -247,12 +269,49 @@ class OpticalSurface:
     def local_xy(self, x: float, y: float) -> Tuple[float, float]:
         return x - self.x0, y - self.y0
 
-    def in_aperture(self, lx: float, ly: float) -> bool:
-        if self.aperture_y is not None and self.aperture_y > 0:
-            ax = max(self.aperture, 1e-9)
-            ay = max(self.aperture_y, 1e-9)
+    def _in_region(
+        self,
+        lx: float,
+        ly: float,
+        semi_x: float,
+        semi_y: Optional[float],
+        *,
+        shape: Optional[str] = None,
+    ) -> bool:
+        """True if (lx, ly) is inside a circle/ellipse/rect of the given semi-sizes."""
+        shape = (shape or self.aperture_shape or "circle").lower()
+        ax = max(float(semi_x), 1e-12)
+        if shape == "rect":
+            ay = max(float(semi_y if semi_y is not None and semi_y > 0 else semi_x), 1e-12)
+            return abs(lx) <= ax + 1e-9 and abs(ly) <= ay + 1e-9
+        # circle / ellipse
+        if semi_y is not None and float(semi_y) > 0 and abs(float(semi_y) - ax) > 1e-12:
+            ay = max(float(semi_y), 1e-12)
             return (lx / ax) ** 2 + (ly / ay) ** 2 <= 1.0 + 1e-9
-        return math.hypot(lx, ly) <= self.aperture + 1e-6
+        return math.hypot(lx, ly) <= ax + 1e-6
+
+    def in_aperture(self, lx: float, ly: float) -> bool:
+        """Outer clear aperture / panel outer extent."""
+        return self._in_region(lx, ly, self.aperture, self.aperture_y)
+
+    def in_hole(self, lx: float, ly: float) -> bool:
+        """True if inside the central hole (aperture stop opening)."""
+        inn = self.inner_aperture
+        if inn is None or float(inn) <= 1e-12:
+            return False
+        return self._in_region(lx, ly, float(inn), self.inner_aperture_y)
+
+    def in_hit_region(self, lx: float, ly: float) -> bool:
+        """
+        Region where the surface actually interacts with the ray.
+        Lenses: outer clear aperture (no hole).
+        Absorbing panels: outer AND NOT hole (annulus / frame).
+        """
+        if not self.in_aperture(lx, ly):
+            return False
+        if self.interaction == "absorb" and self.in_hole(lx, ly):
+            return False
+        return True
 
     def surface_z(self, x: float, y: float) -> Optional[float]:
         lx, ly = self.local_xy(x, y)
@@ -262,6 +321,16 @@ class OpticalSurface:
         return self.z_vertex + s
 
     def normal_at(self, x: float, y: float) -> Optional[Vec3]:
+        g = (self.geom or "asphere").lower()
+        if g == "plane_y":
+            return (0.0, 1.0, 0.0)
+        if g == "plane_x":
+            return (1.0, 0.0, 0.0)
+        if g in ("plane_z", "asphere") and abs(self.radius) < 1e-14 and g == "plane_z":
+            return (0.0, 0.0, 1.0)
+        if g == "cylinder_z":
+            lx, ly = self.local_xy(x, y)
+            return v_norm((lx, ly, 0.0)) if math.hypot(lx, ly) > 1e-15 else (1.0, 0.0, 0.0)
         eps = 1e-5
         zc = self.surface_z(x, y)
         if zc is None:
@@ -276,9 +345,130 @@ class OpticalSurface:
         dzdy = (yp - ym) / (2 * eps)
         return v_norm((-dzdx, -dzdy, 1.0))
 
+    def _z_span(self) -> Tuple[float, float]:
+        half = max(float(self.extent_z), 1e-6)
+        return self.z_vertex - half, self.z_vertex + half
+
+    def _intersect_plane_z(self, o: Vec3, d: Vec3, t_min: float, t_max: float):
+        if abs(d[2]) < 1e-14:
+            return None
+        t = (self.z_vertex - o[2]) / d[2]
+        if t < t_min or t > t_max:
+            return None
+        p = v_add(o, v_scale(d, t))
+        lx, ly = self.local_xy(p[0], p[1])
+        if not self.in_hit_region(lx, ly):
+            return None
+        return t, p, (0.0, 0.0, 1.0)
+
+    def _intersect_plane_y(self, o: Vec3, d: Vec3, t_min: float, t_max: float):
+        """Horizontal baffle: y = y0 + plane_offset, strip in X and Z."""
+        if abs(d[1]) < 1e-14:
+            return None
+        y_plane = self.y0 + self.plane_offset
+        t = (y_plane - o[1]) / d[1]
+        if t < t_min or t > t_max:
+            return None
+        p = v_add(o, v_scale(d, t))
+        z0, z1 = self._z_span()
+        if p[2] < z0 - 1e-9 or p[2] > z1 + 1e-9:
+            return None
+        # Bounds in X (half-width = aperture)
+        if abs(p[0] - self.x0) > max(float(self.aperture), 1e-9) + 1e-9:
+            return None
+        n = (0.0, 1.0 if d[1] < 0 else -1.0, 0.0)  # face incident
+        # Standard: geometric normal +Y; snell path will flip if needed
+        return t, p, (0.0, 1.0, 0.0)
+
+    def _intersect_plane_x(self, o: Vec3, d: Vec3, t_min: float, t_max: float):
+        """Side baffle: x = x0 + plane_offset, strip in Y and Z."""
+        if abs(d[0]) < 1e-14:
+            return None
+        x_plane = self.x0 + self.plane_offset
+        t = (x_plane - o[0]) / d[0]
+        if t < t_min or t > t_max:
+            return None
+        p = v_add(o, v_scale(d, t))
+        z0, z1 = self._z_span()
+        if p[2] < z0 - 1e-9 or p[2] > z1 + 1e-9:
+            return None
+        half_y = max(
+            float(self.aperture_y if self.aperture_y is not None else self.aperture),
+            1e-9,
+        )
+        if abs(p[1] - self.y0) > half_y + 1e-9:
+            return None
+        return t, p, (1.0, 0.0, 0.0)
+
+    def _intersect_cylinder_z(self, o: Vec3, d: Vec3, t_min: float, t_max: float):
+        """
+        Absorbing tube / pipe / lens barrel along +Z.
+        Thin shell at r = aperture (outer radius). Optional inner radius ignores
+        hits with local r < inner (not used for thin shell; both shells if inner set).
+        """
+        # Ray in XY relative to axis (x0, y0)
+        ox, oy = o[0] - self.x0, o[1] - self.y0
+        dx, dy = d[0], d[1]
+        R = max(float(self.aperture), 1e-9)
+        # Quadratic: |o_xy + t d_xy|^2 = R^2
+        a = dx * dx + dy * dy
+        if a < 1e-16:
+            return None  # ray parallel to axis
+        b = 2.0 * (ox * dx + oy * dy)
+        c = ox * ox + oy * oy - R * R
+        disc = b * b - 4.0 * a * c
+        if disc < 0:
+            return None
+        sdisc = math.sqrt(disc)
+        candidates = [(-b - sdisc) / (2.0 * a), (-b + sdisc) / (2.0 * a)]
+        z0, z1 = self._z_span()
+        best = None
+        for t in sorted(candidates):
+            if t < t_min or t > t_max:
+                continue
+            p = v_add(o, v_scale(d, t))
+            if p[2] < z0 - 1e-9 or p[2] > z1 + 1e-9:
+                continue
+            # Optional thick wall: also absorb on inner cylinder
+            n = v_norm((p[0] - self.x0, p[1] - self.y0, 0.0))
+            best = (t, p, n if n != (0.0, 0.0, 0.0) else (1.0, 0.0, 0.0))
+            break
+        if best is not None:
+            return best
+        # Inner shell (bore wall of thick tube)
+        r_in = self.inner_aperture
+        if r_in is None or float(r_in) <= 1e-12 or float(r_in) >= R:
+            return None
+        Ri = float(r_in)
+        c2 = ox * ox + oy * oy - Ri * Ri
+        disc2 = b * b - 4.0 * a * c2
+        if disc2 < 0:
+            return None
+        s2 = math.sqrt(disc2)
+        for t in sorted([(-b - s2) / (2.0 * a), (-b + s2) / (2.0 * a)]):
+            if t < t_min or t > t_max:
+                continue
+            p = v_add(o, v_scale(d, t))
+            if p[2] < z0 - 1e-9 or p[2] > z1 + 1e-9:
+                continue
+            n = v_norm((p[0] - self.x0, p[1] - self.y0, 0.0))
+            return t, p, n if n != (0.0, 0.0, 0.0) else (1.0, 0.0, 0.0)
+        return None
+
     def intersect(self, o: Vec3, d: Vec3, t_min: float = 1e-6, t_max: float = 1e6):
         if not self.active:
             return None
+        g = (self.geom or "asphere").lower()
+        if g == "plane_z":
+            return self._intersect_plane_z(o, d, t_min, t_max)
+        if g == "plane_y":
+            return self._intersect_plane_y(o, d, t_min, t_max)
+        if g == "plane_x":
+            return self._intersect_plane_x(o, d, t_min, t_max)
+        if g == "cylinder_z":
+            return self._intersect_cylinder_z(o, d, t_min, t_max)
+
+        # Default: asphere Newton intersect
         t = (self.z_vertex - o[2]) / d[2] if abs(d[2]) > 1e-12 else t_min + 0.1
         t = max(t, t_min)
         for _ in range(30):
@@ -289,7 +479,7 @@ class OpticalSurface:
             f = p[2] - zs
             if abs(f) < 1e-7:
                 lx, ly = self.local_xy(p[0], p[1])
-                if not self.in_aperture(lx, ly):
+                if not self.in_hit_region(lx, ly):
                     return None
                 if t < t_min or t > t_max:
                     return None
@@ -529,6 +719,241 @@ def build_surfaces(
     return surfaces
 
 
+def default_blocker(
+    *,
+    z: float = 20.0,
+    shape: str = "rect",
+    orient: Optional[str] = None,
+    outer_w: float = 15.0,
+    outer_h: float = 15.0,
+    inner_w: float = 0.0,
+    inner_h: float = 0.0,
+    length: float = 40.0,
+    label: str = "Blocker",
+    enabled: bool = True,
+) -> Dict[str, Any]:
+    """
+    Factory for an absorbing panel / tube / aperture-stop dict.
+
+    orient
+      - ``horizontal`` — rect body: top/bottom (+ sides) along Z (default for rect)
+      - ``vertical`` / ``face`` — Z-normal stop / aperture (face the beam)
+      - ``tube`` — circular pipe / lens barrel along Z (default for circle)
+    """
+    shape = str(shape or "rect").lower()
+    if orient is None:
+        orient = "tube" if shape == "circle" else "horizontal"
+    return {
+        "enabled": bool(enabled),
+        "label": str(label),
+        "z": float(z),
+        "shape": shape,  # "rect" | "circle"
+        "orient": str(orient),  # horizontal | vertical | face | tube
+        "outer_w": float(outer_w),
+        "outer_h": float(outer_h),
+        "inner_w": float(inner_w),
+        "inner_h": float(inner_h),
+        "length": float(length),  # axial span for baffles / tubes (mm)
+        "x0": 0.0,
+        "y0": 0.0,
+        "thickness": 1.0,  # face-stop display thickness (mm)
+    }
+
+
+def build_blockers(blockers: Optional[List[Dict[str, Any]]] = None) -> List[OpticalSurface]:
+    """
+    Build opaque absorbing geometry.
+
+    Orientations
+    ------------
+    * **vertical / face** — Z-normal plane (aperture stop); vertical line in side view
+    * **horizontal** — rectangular tube body: top & bottom (and left & right) walls
+      parallel to the optical axis — horizontal lines in the side view
+    * **tube** — circular cylinder along +Z (camera barrel / snoot / pipe)
+
+    Axial ``length`` is physical for baffles and tubes. Face-stop ``thickness``
+    is display-only (hit is still zero-thickness at Z).
+    """
+    out: List[OpticalSurface] = []
+    if not blockers:
+        return out
+    for i, b in enumerate(blockers):
+        if not isinstance(b, dict) or not b.get("enabled", True):
+            continue
+        shape = str(b.get("shape", "rect") or "rect").lower()
+        if shape not in ("rect", "circle"):
+            shape = "rect"
+        orient = str(b.get("orient") or ("tube" if shape == "circle" else "horizontal")).lower()
+        # Legacy files without orient: circle → tube, rect with hole → face stop
+        if "orient" not in b:
+            if shape == "circle" and float(b.get("inner_w", 0) or 0) <= 1e-12 and float(b.get("length", 0) or 0) <= 1e-12:
+                # Old solid disks were face stops; old circle with only z → treat as tube if length set later
+                if float(b.get("outer_w", 0) or 0) > 0 and float(b.get("thickness", 1) or 1) <= 2.0:
+                    # Prefer tube for circle default going forward; keep face if explicitly a stop hole
+                    orient = "tube"
+            if shape == "rect" and float(b.get("inner_w", 0) or 0) > 1e-12:
+                orient = "vertical"  # old aperture stop
+            elif shape == "rect" and orient not in ("horizontal", "vertical", "face", "tube"):
+                orient = "horizontal"
+        if orient in ("face", "stop", "z"):
+            orient = "vertical"
+        if orient in ("pipe", "barrel", "cylinder"):
+            orient = "tube"
+        if shape == "circle" and orient == "horizontal":
+            orient = "tube"  # circle is never a flat horizontal plate in our model
+
+        outer_w = max(float(b.get("outer_w", 15.0) or 15.0), 1e-3)
+        outer_h = max(float(b.get("outer_h", outer_w) or outer_w), 1e-3)
+        inner_w = max(float(b.get("inner_w", 0.0) or 0.0), 0.0)
+        inner_h = max(float(b.get("inner_h", 0.0) or 0.0), 0.0)
+        z = float(b.get("z", 20.0))
+        x0 = float(b.get("x0", 0.0) or 0.0)
+        y0 = float(b.get("y0", 0.0) or 0.0)
+        lab = str(b.get("label") or f"BLK{i}")
+        # Axial length: prefer length; fall back to thickness for older tube-like entries
+        length = float(b.get("length", 0.0) or 0.0)
+        if length <= 1e-9:
+            length = max(float(b.get("thickness", 40.0) or 40.0), 1.0) if orient != "vertical" else 1.0
+        half_z = 0.5 * max(length, 1e-3)
+        thick_disp = max(float(b.get("thickness", 1.0) or 1.0), 1e-3)
+        base_lab = f"BLK{i}:{lab}"
+
+        if orient == "vertical":
+            # Face-on aperture stop / solid disk (legacy Z plane)
+            if shape == "circle":
+                if inner_w >= outer_w:
+                    inner_w = max(0.0, outer_w * 0.95)
+                ap_y, inn_y = None, None
+            else:
+                if inner_w >= outer_w:
+                    inner_w = max(0.0, outer_w * 0.95)
+                if inner_h >= outer_h:
+                    inner_h = max(0.0, outer_h * 0.95)
+                ap_y = outer_h
+                inn_y = inner_h if inner_w > 1e-12 or inner_h > 1e-12 else None
+            out.append(
+                OpticalSurface(
+                    z_vertex=z,
+                    radius=0.0,
+                    aperture=outer_w,
+                    aperture_y=ap_y,
+                    material_before="AIR",
+                    material_after="AIR",
+                    label=base_lab,
+                    x0=x0,
+                    y0=y0,
+                    mode="rotational",
+                    interaction="absorb",
+                    aperture_shape=shape,
+                    inner_aperture=inner_w if inner_w > 1e-12 else None,
+                    inner_aperture_y=(
+                        inn_y if (inn_y is not None and inn_y > 1e-12) else (
+                            None if shape == "circle" else (inner_h if inner_h > 1e-12 else None)
+                        )
+                    ),
+                    display_thickness=thick_disp,
+                    geom="plane_z",
+                    extent_z=0.5 * thick_disp,
+                )
+            )
+            continue
+
+        if orient == "tube" or shape == "circle":
+            # Circular pipe / lens barrel along +Z
+            if inner_w >= outer_w:
+                inner_w = max(0.0, outer_w * 0.95)
+            out.append(
+                OpticalSurface(
+                    z_vertex=z,
+                    radius=0.0,
+                    aperture=outer_w,  # outer radius
+                    material_before="AIR",
+                    material_after="AIR",
+                    label=base_lab,
+                    x0=x0,
+                    y0=y0,
+                    mode="rotational",
+                    interaction="absorb",
+                    aperture_shape="circle",
+                    inner_aperture=inner_w if inner_w > 1e-12 else None,
+                    display_thickness=length,
+                    geom="cylinder_z",
+                    extent_z=half_z,
+                )
+            )
+            continue
+
+        # horizontal rect body: four walls of a rectangular tube (camera body)
+        # Top / bottom at y = y0 ± outer_h, half-width outer_w in X
+        for sign, tag in ((+1.0, "top"), (-1.0, "bot")):
+            out.append(
+                OpticalSurface(
+                    z_vertex=z,
+                    radius=0.0,
+                    aperture=outer_w,  # half-width in X
+                    material_before="AIR",
+                    material_after="AIR",
+                    label=f"{base_lab}:{tag}",
+                    x0=x0,
+                    y0=y0,
+                    mode="rotational",
+                    interaction="absorb",
+                    aperture_shape="rect",
+                    display_thickness=length,
+                    geom="plane_y",
+                    plane_offset=sign * outer_h,
+                    extent_z=half_z,
+                )
+            )
+        # Left / right at x = x0 ± outer_w, half-height outer_h in Y
+        for sign, tag in ((+1.0, "right"), (-1.0, "left")):
+            out.append(
+                OpticalSurface(
+                    z_vertex=z,
+                    radius=0.0,
+                    aperture=outer_w,
+                    aperture_y=outer_h,
+                    material_before="AIR",
+                    material_after="AIR",
+                    label=f"{base_lab}:{tag}",
+                    x0=x0,
+                    y0=y0,
+                    mode="rotational",
+                    interaction="absorb",
+                    aperture_shape="rect",
+                    display_thickness=length,
+                    geom="plane_x",
+                    plane_offset=sign * outer_w,
+                    extent_z=half_z,
+                )
+            )
+    return out
+
+
+def blockers_need_cpu(surfaces: List[OpticalSurface]) -> bool:
+    """True if any absorber uses non-asphere geometry (Warp lacks full support)."""
+    for s in surfaces:
+        if getattr(s, "interaction", "refract") != "absorb":
+            continue
+        g = (getattr(s, "geom", "asphere") or "asphere").lower()
+        if g not in ("asphere", "plane_z"):
+            return True
+    return False
+
+
+def assemble_surfaces(
+    elements: List[Dict[str, Any]],
+    z_start: float,
+    mla: Optional[Dict[str, Any]] = None,
+    dies: Optional[List[EmitterDie]] = None,
+    blockers: Optional[List[Dict[str, Any]]] = None,
+) -> List[OpticalSurface]:
+    """Refractive stack (+ optional MLA) plus absorbing blockers."""
+    surfs = build_surfaces(elements, z_start, mla=mla, dies=dies)
+    surfs.extend(build_blockers(blockers))
+    return surfs
+
+
 def _clamp_pair_aperture(
     s1: OpticalSurface,
     s2: OpticalSurface,
@@ -549,10 +974,21 @@ def lens_edge_thickness(
     s_front: "OpticalSurface",
     s_rear: "OpticalSurface",
     r: float,
+    *,
+    along_x: bool = False,
 ) -> Optional[float]:
-    """Glass thickness along +Z at radial height r (local to both surfaces)."""
-    z1 = s_front.surface_z(s_front.x0, s_front.y0 + r)
-    z2 = s_rear.surface_z(s_rear.x0, s_rear.y0 + r)
+    """
+    Glass thickness along +Z at height r from the local optical axis.
+    along_x=False → sample the Y meridian; True → the X meridian.
+    Both meridians are needed for cylinders / biconics so the clear aperture
+    is not limited only in the flat direction.
+    """
+    if along_x:
+        z1 = s_front.surface_z(s_front.x0 + r, s_front.y0)
+        z2 = s_rear.surface_z(s_rear.x0 + r, s_rear.y0)
+    else:
+        z1 = s_front.surface_z(s_front.x0, s_front.y0 + r)
+        z2 = s_rear.surface_z(s_rear.x0, s_rear.y0 + r)
     if z1 is None or z2 is None:
         return None
     return z2 - z1
@@ -566,15 +1002,17 @@ def max_aperture_positive_edge(
     samples: int = 48,
 ) -> float:
     """
-    Largest semi-aperture ≤ ap_request with edge thickness ≥ min_edge (mm).
-    Prevents self-intersecting lens drawings / unphysical rims.
+    Largest semi-aperture ≤ ap_request with edge thickness ≥ min_edge (mm)
+    in *both* the X and Y meridians. Prevents self-intersecting lens drawings
+    and keeps resize handles locked to the drawable lens body.
     """
     ap_request = max(float(ap_request), 1e-3)
     best = 0.0
     for i in range(1, samples + 1):
         r = ap_request * i / samples
-        t = lens_edge_thickness(s_front, s_rear, r)
-        if t is None or t < min_edge:
+        t_y = lens_edge_thickness(s_front, s_rear, r, along_x=False)
+        t_x = lens_edge_thickness(s_front, s_rear, r, along_x=True)
+        if t_y is None or t_x is None or t_y < min_edge or t_x < min_edge:
             break
         best = r
     # If even tiny r fails, keep a minimal mechanical radius at vertex thickness
@@ -682,7 +1120,7 @@ class RayPath:
     events: List[str] = field(default_factory=list)
     n_reflections: int = 0
     n_refractions: int = 0
-    terminated: str = ""  # target | tir_absorb | miss | power | bounce_limit | backward
+    terminated: str = ""  # target | tir_absorb | absorb | miss | power | bounce_limit | backward
     # Distinct element ids (E1, E2, MLA0, …) that this ray refracted through
     elements_hit: List[str] = field(default_factory=list)
 
@@ -1099,6 +1537,13 @@ def trace_ray(
         if store_path:
             history.append(p)
 
+        # Opaque panels / aperture stops: kill before media / Snell
+        # (blockers are AIR|AIR so they would otherwise ghost-pass)
+        if getattr(best_s, "interaction", "refract") == "absorb":
+            if store_path:
+                events.append("absorb")
+            return False, None, 0.0, _path("absorb", 0.0)
+
         # Two-sided media from surface definition (not only material_after)
         n1_geom, n2_geom, N_inc = _media_for_hit(best_s, d, nrm, wavelength_nm, custom_n)
         # Trust geometric n1/n2 for Snell (consistent interface); keep n_med for validation
@@ -1197,11 +1642,12 @@ def run_simulation(params: Dict[str, Any], progress_cb=None) -> SimResult:
             n_g = refractive_index(mat, VISIBLE_NM_DEFAULT, float(params.get("custom_n", 1.5)))
             f_mm = thin_lens_focal_length_mm(g["R1"], g["R2"], n_g, g["thickness"])
             apply_mla_die_aim(dies, {**params, "mla": mla}, focal_length=f_mm, aperture=g["aperture"])
-    surfaces = build_surfaces(
+    surfaces = assemble_surfaces(
         params["elements"],
         float(params.get("lens_z_start", 3.0)),
         mla=mla,
         dies=dies,
+        blockers=params.get("blockers"),
     )
     half_w = float(params.get("map_half_w", 50.0))
     half_h = float(params.get("map_half_h", 40.0))
@@ -1218,6 +1664,9 @@ def run_simulation(params: Dict[str, Any], progress_cb=None) -> SimResult:
     fov_w = float(params.get("fov_width", 40.0))
     fov_h = float(params.get("fov_height", 32.0))
     use_warp = bool(params.get("use_warp", True))
+    # Cylinders / horizontal baffles are CPU-traced (Warp path is Z-plane only)
+    if use_warp and blockers_need_cpu(surfaces):
+        use_warp = False
 
     active = [d for d in dies if d.enabled and d.flux > 0]
     paths: List[RayPath] = []
@@ -1228,7 +1677,7 @@ def run_simulation(params: Dict[str, Any], progress_cb=None) -> SimResult:
     total_f = sum(d.flux for d in active)
     power_per = total_f / total_rays
     launched = hit = 0
-    n_tir = n_reflect = n_backward = n_miss = 0
+    n_tir = n_reflect = n_backward = n_miss = n_absorb = 0
     batch = max(50, total_rays // 30)
     backend = "cpu"
 
@@ -1302,6 +1751,8 @@ def run_simulation(params: Dict[str, Any], progress_cb=None) -> SimResult:
         if path is not None:
             if path.terminated == "tir_absorb":
                 n_tir += 1
+            elif path.terminated == "absorb":
+                n_absorb += 1
             elif path.terminated == "backward":
                 n_backward += 1
             elif path.terminated == "miss":
@@ -1332,10 +1783,15 @@ def run_simulation(params: Dict[str, Any], progress_cb=None) -> SimResult:
         )
         efl = lensmaker_f(float(e0["R1"]), float(e0["R2"]), n_use, float(e0["thickness"]))
 
+    # Collection = power that reaches the target *plane* / source power.
+    # Rays that hit the plane outside the irradiance-map window still count
+    # (tracked as missed_power). Without this, removing all lenses looks like
+    # ~0% collection simply because the beam is larger than the map.
+    plane_power = float(imap.total_power) + float(getattr(imap, "missed_power", 0.0) or 0.0)
     stats = {
         "launched": launched,
         "hit": hit,
-        "collection": imap.total_power / total_f if total_f > 0 else 0.0,
+        "collection": plane_power / total_f if total_f > 0 else 0.0,
         "rms": imap.rms_radius(),
         "ee50": imap.encircled_radius(0.5),
         "ee86": imap.encircled_radius(0.86),
@@ -1344,10 +1800,13 @@ def run_simulation(params: Dict[str, Any], progress_cb=None) -> SimResult:
         "fov": fov,
         "source_power": total_f,
         "map_power": imap.total_power,
+        "plane_power": plane_power,
+        "missed_power": float(getattr(imap, "missed_power", 0.0) or 0.0),
         "efl": efl,
         "n_dies": len(active),
         "n_surfaces": len(surfaces),
         "n_tir_absorb": n_tir,
+        "n_absorb": n_absorb,
         "n_reflections": n_reflect,
         "n_backward": n_backward,
         "n_miss": n_miss,
@@ -1382,6 +1841,7 @@ def _empty_stats() -> Dict[str, Any]:
         "n_dies": 0,
         "n_surfaces": 0,
         "n_tir_absorb": 0,
+        "n_absorb": 0,
         "n_reflections": 0,
         "n_backward": 0,
         "n_miss": 0,
@@ -1391,35 +1851,52 @@ def _empty_stats() -> Dict[str, Any]:
 MAX_ELEMENTS = 5
 
 
+# Canonical starter optic — Element 1 and every unused slot share this geometry
+# so enabling/adding lenses one-by-one always begins from the same size & radii.
+DEFAULT_ELEMENT: Dict[str, Any] = {
+    "enabled": False,
+    "R1": 40.0,
+    "R2": -50.0,
+    "thickness": 6.0,
+    "air_after": 2.0,
+    "aperture": 10.0,
+    "material": "ACRYLIC_PMMA",
+    "shape_id": "biconvex",
+    "surface_mode": "rotational",
+    "k1": 0.0,
+    "k2": 0.0,
+    "A4_1": 0.0,
+    "A4_2": 0.0,
+    "R1y": None,
+    "R2y": None,
+    "aperture_y": None,
+}
+
+
 def blank_element(
     *,
     enabled: bool = False,
-    material: str = "N_BK7",
-    shape_id: str = "custom",
+    material: Optional[str] = None,
+    shape_id: Optional[str] = None,
+    surface_mode: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Default unused lens-stack slot (disabled)."""
-    return {
-        "enabled": bool(enabled),
-        "R1": 30.0,
-        "R2": -30.0,
-        "thickness": 3.0,
-        "air_after": 2.0,
-        "aperture": 12.0,
-        "material": material,
-        "shape_id": shape_id,
-        "surface_mode": "rotational",
-        "k1": 0.0,
-        "k2": 0.0,
-        "A4_1": 0.0,
-        "A4_2": 0.0,
-        "R1y": None,
-        "R2y": None,
-        "aperture_y": None,
-    }
+    """
+    Default lens-stack slot — same size, radii, thickness, and material as Element 1.
+    Only ``enabled`` differs (False until the user turns the slot on).
+    """
+    e = dict(DEFAULT_ELEMENT)
+    e["enabled"] = bool(enabled)
+    if material is not None:
+        e["material"] = material
+    if shape_id is not None:
+        e["shape_id"] = shape_id
+    if surface_mode is not None:
+        e["surface_mode"] = surface_mode
+    return e
 
 
 def pad_elements(elements: List[Dict[str, Any]], n: int = MAX_ELEMENTS) -> List[Dict[str, Any]]:
-    """Ensure the stack has exactly ``n`` element slots."""
+    """Ensure the stack has exactly ``n`` element slots (all default geometry)."""
     out = [dict(e) for e in (elements or [])]
     while len(out) < n:
         out.append(blank_element())
@@ -1429,9 +1906,9 @@ def pad_elements(elements: List[Dict[str, Any]], n: int = MAX_ELEMENTS) -> List[
 def default_params() -> Dict[str, Any]:
     return {
         "source": {
-            "mode": "cob",
-            "rows": 4,
-            "cols": 4,
+            "mode": "single",
+            "rows": 1,
+            "cols": 1,
             "pitch_x": 1.6,
             "pitch_y": 1.6,
             "die_width": 1.0,
@@ -1450,29 +1927,12 @@ def default_params() -> Dict[str, Any]:
             "mask_radius": 4.0,
         },
         "elements": [
-            {
-                # Mild bi-convex with positive edge thickness across clear aperture
-                "enabled": True,
-                "R1": 40.0,
-                "R2": -50.0,
-                "thickness": 6.0,
-                "air_after": 2.0,
-                "aperture": 10.0,
-                "material": "ACRYLIC_PMMA",
-                "shape_id": "biconvex",
-                "surface_mode": "rotational",
-                "k1": 0.0,
-                "k2": 0.0,
-                "A4_1": 0.0,
-                "A4_2": 0.0,
-                "R1y": None,
-                "R2y": None,
-                "aperture_y": None,
-            },
-            blank_element(material="N_BK7"),
-            blank_element(material="FORMLABS_CLEAR"),
-            blank_element(material="ACRYLIC_PMMA"),
-            blank_element(material="N_BK7"),
+            # Element 1 only enabled; remaining slots match the same starter optic
+            {**dict(DEFAULT_ELEMENT), "enabled": True},
+            blank_element(),
+            blank_element(),
+            blank_element(),
+            blank_element(),
         ],
         "lens_z_start": 3.0,
         "custom_n": 1.5,
@@ -1500,4 +1960,6 @@ def default_params() -> Dict[str, Any]:
             "aim_to_fov": True,  # each channel steers toward FOV center
             "aim_strength": 1.0,  # 0 = none, 1 = full geometric aim
         },
+        # Opaque absorbing panels / aperture stops (enclosure simulation)
+        "blockers": [],
     }

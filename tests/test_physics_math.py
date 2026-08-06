@@ -100,10 +100,25 @@ class TestMaterialsCatalog(unittest.TestCase):
         n2 = refractive_index("PMMA", LAMBDA_D)
         self.assertAlmostEqual(n, n2, places=6)
 
+    def test_polycarbonate_nd(self):
+        n = refractive_index("POLYCARBONATE", LAMBDA_D)
+        self.assertAlmostEqual(n, 1.585, places=2)
+
     def test_formlabs_clear_range(self):
         n = refractive_index("FORMLABS_CLEAR", LAMBDA_D)
         self.assertGreater(n, 1.50)
         self.assertLess(n, 1.58)
+
+    def test_catalog_n_d_ref_matches_model(self):
+        """All materials that declare n_d_ref must match the dispersion model."""
+        for mid, m in MATERIALS.items():
+            if "n_d_ref" not in m:
+                continue
+            n = refractive_index(mid, LAMBDA_D)
+            tol = 0.002 if m.get("category") in ("glass", "crystal") else 0.005
+            self.assertAlmostEqual(
+                n, float(m["n_d_ref"]), delta=tol, msg=mid
+            )
 
     def test_dispersion_normal(self):
         # Normal dispersion: n_F > n_d > n_C for glasses
@@ -405,6 +420,7 @@ class TestRayTracePhysics(unittest.TestCase):
 
     def test_mla_surfaces_per_die(self):
         p = default_params()
+        p["source"]["mode"] = "cob"
         p["source"]["rows"] = 2
         p["source"]["cols"] = 2
         p["mla"]["enabled"] = True
@@ -421,6 +437,7 @@ class TestRayTracePhysics(unittest.TestCase):
     def test_mla_aim_offsets_toward_fov_center(self):
         """With aim on, outer dies get lens centres shifted (still near the die)."""
         p = default_params()
+        p["source"]["mode"] = "cob"
         p["source"]["rows"] = 2
         p["source"]["cols"] = 2
         p["source"]["pitch_x"] = 2.0
@@ -557,6 +574,9 @@ class TestMeshExportConsistency(unittest.TestCase):
     def test_mla_scales_element1_form_to_pitch(self):
         """Default bi-convex Element 1 → micro R/t when MLA scale_to_pitch is on."""
         p = default_params()
+        p["source"]["mode"] = "cob"
+        p["source"]["rows"] = 4
+        p["source"]["cols"] = 4
         p["mla"]["enabled"] = True
         p["mla"]["scale_to_pitch"] = True
         dies = build_source_array(p["source"])
@@ -573,6 +593,9 @@ class TestMeshExportConsistency(unittest.TestCase):
     def test_mla_export_monolithic_with_domes(self):
         """CAD export is one solid plate with curved lenslets, not flat cylinders."""
         p = default_params()
+        p["source"]["mode"] = "cob"
+        p["source"]["rows"] = 4
+        p["source"]["cols"] = 4
         p["mla"]["enabled"] = True
         p["mla"]["scale_to_pitch"] = True
         dies = build_source_array(p["source"])

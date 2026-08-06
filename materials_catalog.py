@@ -151,9 +151,10 @@ MATERIALS: Dict[str, Dict[str, Any]] = {
     "POLYCARBONATE": {
         "name": "Polycarbonate (PC)",
         "type": "cauchy",
-        "A": 1.5857,
-        "B": 0.008378,
-        "C": 0.0002,
+        # Fitted so n_d ≈ 1.585 and V_d ≈ 30 (typical optical PC)
+        "A": 1.556496,
+        "B": 0.009552,
+        "C": 0.000100,
         "category": "plastic",
         "n_d_ref": 1.585,
         "notes": "Impact-resistant molded optics; higher n and dispersion than PMMA.",
@@ -161,10 +162,10 @@ MATERIALS: Dict[str, Dict[str, Any]] = {
     "COC_ZEONEX": {
         "name": "COC / COP (Zeonex-class)",
         "type": "cauchy",
-        # Typical optical COP n_d ≈ 1.53
-        "A": 1.525,
-        "B": 0.0045,
-        "C": 0.00015,
+        # Fitted so n_d ≈ 1.530 and V_d ≈ 56 (typical optical COP / Zeonex-class)
+        "A": 1.516711,
+        "B": 0.004299,
+        "C": 0.000100,
         "category": "plastic",
         "n_d_ref": 1.53,
         "notes": "Low birefringence precision plastic optics.",
@@ -172,9 +173,10 @@ MATERIALS: Dict[str, Dict[str, Any]] = {
     "STYRENE": {
         "name": "Polystyrene (PS)",
         "type": "cauchy",
-        "A": 1.5905,
-        "B": 0.0095,
-        "C": 0.0003,
+        # Fitted so n_d ≈ 1.590 and V_d ≈ 31
+        "A": 1.562205,
+        "B": 0.009307,
+        "C": 0.000100,
         "category": "plastic",
         "n_d_ref": 1.590,
     },
@@ -184,9 +186,10 @@ MATERIALS: Dict[str, Dict[str, Any]] = {
     "FORMLABS_CLEAR": {
         "name": "Formlabs Clear Resin",
         "type": "cauchy",
-        "A": 1.530,
-        "B": 0.0040,
-        "C": 0.00012,
+        # Mild dispersion around n_d ≈ 1.54 (approx. SLA resin data)
+        "A": 1.524686,
+        "B": 0.004998,
+        "C": 0.000100,
         "category": "photopolymer",
         "n_d_ref": 1.54,
         "notes": "SLA prototype optics; n≈1.53–1.55 (approx.). Polish/coat as needed.",
@@ -223,23 +226,45 @@ MATERIALS: Dict[str, Dict[str, Any]] = {
     },
 }
 
-# Backward-compatible aliases used in older params / presets
+# Backward-compatible aliases used in older params / presets / UI free-text
 _ALIASES = {
     "BK7": "N_BK7",
     "SF11": "N_SF11",
     "PMMA": "ACRYLIC_PMMA",
     "ACRYLIC": "ACRYLIC_PMMA",
+    # Common short / alternate labels → canonical Formlabs Clear
+    "CLEAR RESIN": "FORMLABS_CLEAR",
+    "CLEAR": "FORMLABS_CLEAR",
+    "FORMLABS CLEAR": "FORMLABS_CLEAR",
+    "FORMLABS CLEAR RESIN": "FORMLABS_CLEAR",
+    "FORMLABS_CLEAR_RESIN": "FORMLABS_CLEAR",
 }
 
 
 def resolve_material_id(mat_id: str) -> str:
-    if mat_id in MATERIALS:
-        return mat_id
-    return _ALIASES.get(mat_id, mat_id)
+    if not mat_id:
+        return "N_BK7"
+    s = str(mat_id).strip()
+    if s in MATERIALS:
+        return s
+    # Case-insensitive alias / id match
+    up = s.upper().replace("-", " ").replace("_", " ")
+    up_key = s.upper().replace(" ", "_").replace("-", "_")
+    if up_key in MATERIALS:
+        return up_key
+    if up_key in _ALIASES:
+        return _ALIASES[up_key]
+    if up in _ALIASES:
+        return _ALIASES[up]
+    # Compact spaces for alias table
+    compact = " ".join(up.split())
+    if compact in _ALIASES:
+        return _ALIASES[compact]
+    return _ALIASES.get(s, s)
 
 
 def material_display_names() -> List[str]:
-    """Ordered labels for UI dropdowns."""
+    """Ordered labels for UI dropdowns (exactly one label per material)."""
     order = [
         "AIR",
         "N_BK7",
@@ -262,24 +287,49 @@ def material_display_names() -> List[str]:
         "FORMLABS_RIGID",
         "CUSTOM",
     ]
-    return [MATERIALS[k]["name"] for k in order if k in MATERIALS]
+    names = [MATERIALS[k]["name"] for k in order if k in MATERIALS]
+    # Deduplicate while preserving order (guards against catalog typos)
+    seen = set()
+    out = []
+    for n in names:
+        if n not in seen:
+            seen.add(n)
+            out.append(n)
+    return out
 
 
 def material_id_from_name(name: str) -> str:
+    """Map a UI label or raw id to a canonical MATERIALS key."""
+    if not name:
+        return "N_BK7"
+    s = str(name).strip()
+    # Exact display-name match
     for k, m in MATERIALS.items():
-        if m["name"] == name:
+        if m["name"] == s:
             return k
-    # try raw id
-    rid = resolve_material_id(name)
+    # Case-insensitive display-name match
+    low = s.casefold()
+    for k, m in MATERIALS.items():
+        if str(m["name"]).casefold() == low:
+            return k
+    # Partial match for common short forms ("Clear Resin" → Formlabs Clear Resin)
+    for k, m in MATERIALS.items():
+        nm = str(m["name"]).casefold()
+        if low in nm or nm in low:
+            if "formlabs" in nm or "clear" in low:
+                return k
+    # Raw id / alias
+    rid = resolve_material_id(s)
     if rid in MATERIALS:
         return rid
     return "N_BK7"
 
 
 def material_name_from_id(mat_id: str) -> str:
-    mid = resolve_material_id(mat_id)
+    """Always return the canonical catalog display name (never a raw id)."""
+    mid = material_id_from_name(str(mat_id))
     m = MATERIALS.get(mid)
-    return m["name"] if m else mat_id
+    return m["name"] if m else MATERIALS["N_BK7"]["name"]
 
 
 def material_ids() -> List[str]:

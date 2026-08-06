@@ -110,10 +110,12 @@ class TestNoSpuriousReflection(unittest.TestCase):
 
     def test_strong_lens_absorb_tir_no_reflect_events(self):
         p = default_params()
+        p["source"]["mode"] = "single"
         p["elements"][0].update(
-            R1=8, R2=-10, thickness=6, aperture=12, material="ACRYLIC_PMMA"
+            R1=4, R2=-4, thickness=10, aperture=8, material="N_SF11"
         )
-        p["source"]["half_angle_deg"] = 85
+        p["source"]["half_angle_deg"] = 89
+        p["lens_z_start"] = 1.0
         n_reflect_events = 0
         n_tir_term = 0
         for ok, pt, pout, path, _ in _paths_for(p, 800, absorb_on_tir=True, max_reflections=0):
@@ -133,8 +135,10 @@ class TestNoSpuriousReflection(unittest.TestCase):
     def test_allow_tir_reflect_can_go_backward(self):
         """With TIR bounce enabled, some paths may reverse — documents the hazard."""
         p = default_params()
-        p["elements"][0].update(R1=8, R2=-10, thickness=6, aperture=12)
-        p["source"]["half_angle_deg"] = 85
+        p["source"]["mode"] = "single"
+        p["elements"][0].update(R1=4, R2=-4, thickness=10, aperture=8, material="N_SF11")
+        p["source"]["half_angle_deg"] = 89
+        p["lens_z_start"] = 1.0
         saw_back = False
         saw_reflect = False
         for ok, pt, pout, path, _ in _paths_for(

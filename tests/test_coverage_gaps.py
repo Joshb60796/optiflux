@@ -111,6 +111,110 @@ class TestEngineIntersectEdges(unittest.TestCase):
         self.assertAlmostEqual(s.sag_xy(5.0, 0.0) or 0.0, 0.0, places=8)
         self.assertGreater(abs(s.sag_xy(0.0, 5.0) or 0.0), 0.05)
 
+
+    def test_cylinder_y_biconvex_both_faces_from_R1_R2(self):
+        """
+        Regression: cylinder_y must curve BOTH front and rear when R1 and R2
+        are set and R1y/R2y are None (the UI contract after the R1y-stale fix).
+
+        Earlier tests only built a *single* OpticalSurface with radius=30 — they
+        never went through build_surfaces() with a two-sided element dict, so a
+        plano rear or a stale R1y overriding R1 would not have failed.
+        """
+        from engine import build_surfaces
+
+        el = {
+            "enabled": True,
+            "R1": 40.0,
+            "R2": -50.0,
+            "thickness": 6.0,
+            "air_after": 2.0,
+            "aperture": 10.0,
+            "material": "ACRYLIC_PMMA",
+            "surface_mode": "cylinder_y",
+            "R1y": None,
+            "R2y": None,
+            "k1": 0.0,
+            "k2": 0.0,
+            "A4_1": 0.0,
+            "A4_2": 0.0,
+        }
+        surfs = build_surfaces([el], z_start=3.0)
+        self.assertEqual(len(surfs), 2)
+        # Front and rear both powered in Y
+        sag_f = surfs[0].sag_xy(0.0, 5.0)
+        sag_r = surfs[1].sag_xy(0.0, 5.0)
+        self.assertIsNotNone(sag_f)
+        self.assertIsNotNone(sag_r)
+        self.assertGreater(abs(sag_f), 0.15)
+        self.assertGreater(abs(sag_r), 0.10)
+        # Flat in X (both faces)
+        self.assertAlmostEqual(surfs[0].sag_xy(5.0, 0.0) or 0.0, 0.0, places=8)
+        self.assertAlmostEqual(surfs[1].sag_xy(5.0, 0.0) or 0.0, 0.0, places=8)
+
+    def test_cylinder_x_biconvex_both_faces_from_R1_R2(self):
+        """Same contract for cylinder_x — both faces powered in X from R1/R2."""
+        from engine import build_surfaces
+
+        el = {
+            "enabled": True,
+            "R1": 40.0,
+            "R2": -50.0,
+            "thickness": 6.0,
+            "air_after": 2.0,
+            "aperture": 10.0,
+            "material": "ACRYLIC_PMMA",
+            "surface_mode": "cylinder_x",
+            "R1y": None,
+            "R2y": None,
+            "k1": 0.0,
+            "k2": 0.0,
+            "A4_1": 0.0,
+            "A4_2": 0.0,
+        }
+        surfs = build_surfaces([el], z_start=3.0)
+        self.assertEqual(len(surfs), 2)
+        self.assertGreater(abs(surfs[0].sag_xy(5.0, 0.0) or 0.0), 0.15)
+        self.assertGreater(abs(surfs[1].sag_xy(5.0, 0.0) or 0.0), 0.10)
+        self.assertAlmostEqual(surfs[0].sag_xy(0.0, 5.0) or 0.0, 0.0, places=8)
+        self.assertAlmostEqual(surfs[1].sag_xy(0.0, 5.0) or 0.0, 0.0, places=8)
+
+    def test_cylinder_y_stale_R1y_must_not_dominate_when_none_intended(self):
+        """
+        The UI bug: R1 was changed to 25 but R1y DoubleVar still held 40, and
+        collect_params always wrote R1y into the element dict. Engine then used
+        radius_y=40, so the R1 slider appeared dead for cylinder_y.
+
+        Contract: when R1y is None, Y power comes from R1 (front) / R2 (rear).
+        """
+        from engine import build_surfaces
+
+        el = {
+            "enabled": True,
+            "R1": 25.0,   # intended power
+            "R2": -30.0,
+            "thickness": 5.0,
+            "air_after": 1.0,
+            "aperture": 10.0,
+            "material": "ACRYLIC_PMMA",
+            "surface_mode": "cylinder_y",
+            "R1y": None,  # must NOT be a stale 40
+            "R2y": None,
+            "k1": 0.0,
+            "k2": 0.0,
+            "A4_1": 0.0,
+            "A4_2": 0.0,
+        }
+        surfs = build_surfaces([el], z_start=2.0)
+        sag_r1 = surfs[0].sag_xy(0.0, 5.0)
+        # Sag for R=25 at r=5 is larger than for R=40
+        el_stale = dict(el, R1y=40.0, R2y=-50.0)
+        surfs_stale = build_surfaces([el_stale], z_start=2.0)
+        sag_stale = surfs_stale[0].sag_xy(0.0, 5.0)
+        # With R1y=None, power tracks R1=25 (stronger sag than R=40)
+        self.assertGreater(abs(sag_r1 or 0.0), abs(sag_stale or 0.0) + 0.05)
+
+
     def test_biconic_asymmetric_sag(self):
         s = OpticalSurface(
             z_vertex=0.0, radius=20.0, radius_y=40.0, mode="biconic", aperture=8.0
@@ -195,12 +299,31 @@ class TestCollectionBound(unittest.TestCase):
         self.assertGreater(r.stats["collection"], 0.0)
         self.assertLessEqual(r.stats["collection"], 1.0 + 1e-9)
 
-    def test_no_optics_low_collection(self):
-        p = _single_lens_params(total_rays=1000)
+    def test_no_optics_still_reaches_target_plane(self):
+        """
+        Without lenses, Lambertian rays still hit the target plane.
+        Collection must count plane hits outside the map window
+        (missed_power), not only bins inside the map — otherwise
+        removing all optics falsely reports ~0% collection.
+        """
+        p = _single_lens_params(total_rays=2000)
         for e in p["elements"]:
             e["enabled"] = False
+        # Small map so most unfocused power lands *outside* the window
+        p["map_half_w"] = 8.0
+        p["map_half_h"] = 6.0
         r = run_simulation(p)
+        self.assertEqual(r.stats["n_surfaces"], 0)
         self.assertLessEqual(r.stats["collection"], 1.0 + 1e-9)
+        # Near all forward rays reach the plane → collection ≈ 1, not ≈ 0
+        self.assertGreater(
+            r.stats["collection"],
+            0.85,
+            "no-optics collection must count target-plane hits outside the map",
+        )
+        self.assertGreater(r.stats.get("missed_power", 0.0), 0.0)
+        # Map-only power is a small fraction when the beam is unfocused
+        self.assertLess(r.stats["map_power"], 0.5 * r.stats["source_power"])
 
 
 # ═══════════════════════════════════════════════════════════════════════════

@@ -55,6 +55,10 @@ class OptimizeConfig:
     aspect_weight: float = 0.0  # 0 → ignore footprint aspect (circular OK)
     fill_weight: float = 2.0  # weight on size_error (under-fill of FOV)
     coverage_mix: float = 0.9  # how hard to require FOV bin / profile fill (0–1)
+    # Penalize light that reaches the target *plane* outside the FOV rectangle
+    # (spill) and light that never lands in the FOV at all (waste).
+    spill_weight: float = 1.5  # plane power outside FOV / source
+    waste_weight: float = 0.8  # (1 − fov_flux) soft penalty
     # Two-phase rectangular FOV design:
     #   Phase 1 — rotational (or current) optics → even light in FOV
     #   Phase 2 — add N anamorphic lenses → reshape footprint to FOV W/H
@@ -529,11 +533,15 @@ def evaluate_fov_flux(
     Run a coarse Monte-Carlo and return
     (score, fov_flux, uniformity, collection, aspect_error, footprint_aspect).
 
-    Score strongly rewards *filling* the rectangular FOV:
+    Score strongly rewards a *filled, even rectangle* of light in the FOV and
+    penalizes light that misses the FOV:
+
       - fov_flux: power inside FOV / source power
-      - coverage: fraction of FOV bins lit (≥10% of peak-in-FOV)
-      - size_error: under-fill of σx,σy vs uniform-rectangle ideal (asymmetric)
-      - aspect_error: σx/σy vs FOV W/H
+      - coverage / profile_fill: FOV area and line-cut fill
+      - uniformity: Emin/Emax over lit FOV bins
+      - spill: plane power outside the FOV rectangle / source
+      - waste: 1 − fov_flux (light not in FOV at all)
+      - size_error / aspect_error: footprint shape vs FOV
     """
     p = copy.deepcopy(params)
     p["total_rays"] = int(cfg.rays_per_eval)
@@ -555,6 +563,10 @@ def evaluate_fov_flux(
         power_in = float(fov.get("fraction", 0.0)) * float(st["map_power"])
     fov_flux = power_in / src
     collection = float(st.get("collection", 0.0))
+    plane_power = float(st.get("plane_power", st.get("map_power", 0.0)) or 0.0)
+    # Light on the target plane but outside the FOV rectangle
+    spill = max(0.0, (plane_power - power_in) / src)
+    waste = max(0.0, 1.0 - fov_flux)
     uniformity = float(fov.get("uniformity", 0.0))
     aspect_error = float(fov.get("aspect_error", 0.0))
     footprint_aspect = float(fov.get("footprint_aspect", 1.0))
@@ -573,13 +585,22 @@ def evaluate_fov_flux(
     # cannot be rescued by a high flux term alone.
     w_u = max(0.0, float(cfg.uniformity_weight))
     uni_factor = (0.15 + 0.85 * uniformity) ** max(0.5, min(2.0, 0.5 + w_u))
-    score = fov_flux * fill_factor * uni_factor
+    # Containment: of all plane power, how much is inside FOV (1 = no spill on plane)
+    containment = power_in / max(plane_power, 1e-30) if plane_power > 1e-30 else 0.0
+    contain_factor = 0.35 + 0.65 * min(1.0, max(0.0, containment))
+    score = fov_flux * fill_factor * uni_factor * contain_factor
     w_a = float(cfg.aspect_weight)
     if w_a > 0:
         score = score / (1.0 + w_a * aspect_error)
     w_s = float(cfg.fill_weight)
     if w_s > 0:
         score = score / (1.0 + w_s * size_error)
+    w_spill = max(0.0, float(getattr(cfg, "spill_weight", 0.0) or 0.0))
+    if w_spill > 0:
+        score = score / (1.0 + w_spill * spill)
+    w_waste = max(0.0, float(getattr(cfg, "waste_weight", 0.0) or 0.0))
+    if w_waste > 0:
+        score = score / (1.0 + w_waste * waste * 0.5)
     # Landscape FOV must not keep a portrait beam (and vice versa).
     if orientation_flipped > 0.5:
         score *= 0.35

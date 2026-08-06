@@ -14,6 +14,7 @@ Cancel between batches when the GUI generation counter advances.
 """
 from __future__ import annotations
 
+import math
 import random
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -22,8 +23,9 @@ from engine import (
     RayPath,
     SimResult,
     VISIBLE_NM_DEFAULT,
+    assemble_surfaces,
+    blockers_need_cpu,
     build_source_array,
-    build_surfaces,
     lensmaker_f,
     refractive_index,
     trace_ray,
@@ -56,6 +58,7 @@ def _empty_stats() -> Dict[str, Any]:
         "n_dies": 0,
         "n_surfaces": 0,
         "n_tir_absorb": 0,
+        "n_absorb": 0,
         "n_reflections": 0,
         "n_backward": 0,
         "n_miss": 0,
@@ -75,6 +78,7 @@ def _finalize_stats(
     active: list,
     params: Dict[str, Any],
     n_tir: int = 0,
+    n_absorb: int = 0,
     n_reflect: int = 0,
     n_backward: int = 0,
     n_miss: int = 0,
@@ -115,6 +119,9 @@ def _finalize_stats(
     # batch has run). Avoids collection ≈ batch_count × true_efficiency.
     n_avg = max(int(batch_i), 1)
     map_power_avg = imap.total_power / n_avg
+    missed_avg = float(getattr(imap, "missed_power", 0.0) or 0.0) / n_avg
+    # Plane collection includes hits outside the map window (unfocused beams).
+    plane_power_avg = map_power_avg + missed_avg
     peak_avg = imap.max_irradiance() / n_avg
     if "power_in" in fov:
         fov = dict(fov)
@@ -128,7 +135,7 @@ def _finalize_stats(
     return {
         "launched": launched,
         "hit": hit,
-        "collection": map_power_avg / total_f if total_f > 0 else 0.0,
+        "collection": plane_power_avg / total_f if total_f > 0 else 0.0,
         "rms": imap.rms_radius(),
         "ee50": imap.encircled_radius(0.5),
         "ee86": imap.encircled_radius(0.86),
@@ -137,10 +144,13 @@ def _finalize_stats(
         "fov": fov,
         "source_power": total_f,
         "map_power": map_power_avg,
+        "plane_power": plane_power_avg,
+        "missed_power": missed_avg,
         "efl": efl,
         "n_dies": len(active),
         "n_surfaces": len(surfaces),
         "n_tir_absorb": n_tir,
+        "n_absorb": n_absorb,
         "n_reflections": n_reflect,
         "n_backward": n_backward,
         "n_miss": n_miss,
@@ -165,14 +175,14 @@ def _trace_cpu_batch(
     kill_backward: bool,
     imap: IrradianceMap,
     accumulate_map: bool = True,
-) -> Tuple[List[RayPath], int, int, int, int, int, int]:
-    """Trace a CPU batch. Returns (paths, launched, hit, tir, refl, back, miss)."""
+) -> Tuple[List[RayPath], int, int, int, int, int, int, int]:
+    """Trace a CPU batch. Returns (paths, launched, hit, tir, absorb, refl, back, miss)."""
     paths: List[RayPath] = []
     if n_rays < 1 or not active:
-        return paths, 0, 0, 0, 0, 0, 0
+        return paths, 0, 0, 0, 0, 0, 0, 0
     power_per = total_f / n_rays
     launched = hit = 0
-    n_tir = n_reflect = n_backward = n_miss = 0
+    n_tir = n_absorb = n_reflect = n_backward = n_miss = 0
     for _ in range(n_rays):
         r = random.random() * total_f
         die = active[0]
@@ -184,6 +194,7 @@ def _trace_cpu_batch(
         o, d, pwr, wl = die.spawn_ray(power_per)
         # When this batch exists only to build side-view paths (n_display ≈ n_rays),
         # store every ray until the budget is filled. Otherwise sample randomly.
+        display_only = (not accumulate_map) and n_display >= max(1, int(0.5 * n_rays))
         if n_display >= n_rays:
             store = len(paths) < n_display
         else:
@@ -191,6 +202,18 @@ def _trace_cpu_batch(
                 random.random() < (n_display / max(n_rays, 1)) * 1.4
                 or len(paths) < min(40, n_display)
             )
+        # Display-only batch: mild bias toward both meridional planes so the
+        # Y–Z and X–Z side views are both populated. Map stats stay unbiased.
+        if display_only and store:
+            ox, oy, oz = o
+            # Keep emission near the die centre (both meridians)
+            o = (0.25 * ox, 0.25 * oy, oz)
+            dx, dy, dz = d
+            # Soften both transverse components equally (not only X)
+            dx *= 0.35
+            dy *= 0.35
+            nrm = math.sqrt(dx * dx + dy * dy + dz * dz) or 1.0
+            d = (dx / nrm, dy / nrm, dz / nrm)
         ok, pt, pwr_out, path = trace_ray(
             o,
             d,
@@ -210,6 +233,8 @@ def _trace_cpu_batch(
             term = path.terminated
             if term == "tir_absorb":
                 n_tir += 1
+            elif term == "absorb":
+                n_absorb += 1
             elif term == "backward":
                 n_backward += 1
             elif term == "miss":
@@ -219,15 +244,8 @@ def _trace_cpu_batch(
             hit += 1
             imap.deposit(pt[0], pt[1], pwr_out)
         if store and path is not None and len(path.history) >= 2:
-            # Prefer meridional paths (small |X|) for the side-view Y–Z plot so
-            # rays that miss a circular aperture off-axis are not drawn as if
-            # they crossed every lens silhouette.
-            max_x = max(abs(pt[0]) for pt in path.history)
-            if max_x <= 1.5 or len(paths) < max(1, int(n_display * 0.35)) or n_display >= n_rays:
-                paths.append(path)
-            elif len(paths) < n_display and random.random() < 0.25:
-                paths.append(path)
-    return paths, launched, hit, n_tir, n_reflect, n_backward, n_miss
+            paths.append(path)
+    return paths, launched, hit, n_tir, n_absorb, n_reflect, n_backward, n_miss
 
 
 def _inject_warp_grid(imap: IrradianceMap, warp_grid, warp_stats) -> Tuple[int, int, str]:
@@ -305,11 +323,12 @@ def run_simulation_progressive(
             apply_mla_die_aim(
                 dies, {**params, "mla": mla}, focal_length=f_mm, aperture=g["aperture"]
             )
-    surfaces = build_surfaces(
+    surfaces = assemble_surfaces(
         params["elements"],
         float(params.get("lens_z_start", 3.0)),
         mla=mla,
         dies=dies,
+        blockers=params.get("blockers"),
     )
     half_w = float(params.get("map_half_w", 50.0))
     half_h = float(params.get("map_half_h", 40.0))
@@ -323,6 +342,8 @@ def run_simulation_progressive(
     max_refl = int(params.get("max_reflections", 0))
     kill_backward = bool(params.get("kill_backward", True))
     use_warp = bool(params.get("use_warp", True))
+    if use_warp and blockers_need_cpu(surfaces):
+        use_warp = False
 
     active = [d for d in dies if d.enabled and d.flux > 0]
     if not active or n_batches < 1 or rays_per_batch < 1:
@@ -334,7 +355,7 @@ def run_simulation_progressive(
 
     total_f = sum(d.flux for d in active)
     launched = hit = 0
-    n_tir = n_reflect = n_backward = n_miss = 0
+    n_tir = n_absorb = n_reflect = n_backward = n_miss = 0
     backend = "cpu"
     paths: List[RayPath] = []
     final: Optional[SimResult] = None
@@ -371,7 +392,7 @@ def run_simulation_progressive(
                 print(f"[OptiFlux] Warp batch skipped: {exc}")
 
         if not warp_ok:
-            _p, bl, bh, t, rf, bk, ms = _trace_cpu_batch(
+            _p, bl, bh, t, ab, rf, bk, ms = _trace_cpu_batch(
                 active=active,
                 surfaces=surfaces,
                 target_z=target_z,
@@ -389,6 +410,7 @@ def run_simulation_progressive(
             batch_launched = bl
             batch_hit = bh
             n_tir += t
+            n_absorb += ab
             n_reflect += rf
             n_backward += bk
             n_miss += ms
@@ -399,7 +421,7 @@ def run_simulation_progressive(
 
         # Side-view paths: always CPU; replace each batch
         if display_per_batch > 0:
-            new_paths, _, _, t2, rf2, bk2, ms2 = _trace_cpu_batch(
+            new_paths, _, _, t2, ab2, rf2, bk2, ms2 = _trace_cpu_batch(
                 active=active,
                 surfaces=surfaces,
                 target_z=target_z,
@@ -416,6 +438,7 @@ def run_simulation_progressive(
             )
             paths = new_paths
             n_tir += t2
+            n_absorb += ab2
             n_reflect += rf2
             n_backward += bk2
             n_miss += ms2
@@ -429,6 +452,7 @@ def run_simulation_progressive(
             active=active,
             params=params,
             n_tir=n_tir,
+            n_absorb=n_absorb,
             n_reflect=n_reflect,
             n_backward=n_backward,
             n_miss=n_miss,

@@ -29,6 +29,10 @@ def run_all(*, with_coverage: bool = False):
     import unittest
 
     import test_physics_math  # noqa: F401
+    import test_physics_correctness  # noqa: F401
+    import test_blockers  # noqa: F401
+    import test_optimizer_spill  # noqa: F401
+    import test_view3d  # noqa: F401
     import test_ray_path_integrity  # noqa: F401
     import test_features_extended  # noqa: F401
     import test_coverage_gaps  # noqa: F401
@@ -36,6 +40,10 @@ def run_all(*, with_coverage: bool = False):
     loader = unittest.TestLoader()
     suite = unittest.TestSuite()
     suite.addTests(loader.loadTestsFromModule(test_physics_math))
+    suite.addTests(loader.loadTestsFromModule(test_physics_correctness))
+    suite.addTests(loader.loadTestsFromModule(test_blockers))
+    suite.addTests(loader.loadTestsFromModule(test_optimizer_spill))
+    suite.addTests(loader.loadTestsFromModule(test_view3d))
     suite.addTests(loader.loadTestsFromModule(test_ray_path_integrity))
     suite.addTests(loader.loadTestsFromModule(test_features_extended))
     suite.addTests(loader.loadTestsFromModule(test_coverage_gaps))
