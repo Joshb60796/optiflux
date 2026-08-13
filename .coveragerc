@@ -8,6 +8,8 @@ source =
     export_cad
     materials_catalog
     lens_shapes
+    calibrate
+    design_io
 omit =
     app.py
     validate_physics.py

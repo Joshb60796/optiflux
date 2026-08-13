@@ -24,7 +24,7 @@ In PyCharm: right-click `app.py` → **Run**.
 - Single LED or COB grid (pitch, stagger, circular mask, tilt)
 
 ### Optics
-- Up to 3 elements; **per-element** lens type library (PCX, bi-convex, meniscus, …)
+- Up to 8 elements; **per-element** lens type library (PCX, bi-convex, meniscus, …)
 - Spherical / conic / A4, biconic and cylindrical (anamorphic) modes
 - Materials: N-BK7, flints, fused silica, acrylic, Formlabs resins, etc. (visible 380–780 nm)
 - Snell, Fresnel T, TIR absorb (default), positive edge-thickness clamping
@@ -38,18 +38,20 @@ In PyCharm: right-click `app.py` → **Run**.
 
 ### CAD
 - Export **STL** / **STEP** in **mm**
+- Print tessellation: **max vertex length** and **max facet angle** (Optics → CAD export)
 
 ### Rectangular FOV design
 - Crossed cylinders or biconic singlet helpers for camera-like fields
 
-### Optimizer (rectangular FOV flux)
+### Optimizer (left-panel OPTIMIZER)
 - Derivative-free search (SciPy differential evolution + optional Nelder–Mead polish)
-- **Two-phase rectangular mode** (default in GUI):
+- Goals: **rectangular FOV fill**, **sharpest focus** (crisp illumination border), **maximum evenness**
+- Extra lenses are **opt-in** (checkbox) and capped (0–8, stack limit 8)
+- **Two-phase rectangular mode** only when extras are allowed:
   1. Even light in the FOV (flux + uniformity; circular footprint OK)
-  2. Add 1–2 anamorphic elements (crossed cylinders or biconic) and match footprint aspect to FOV W/H — not limited to a circular zone
+  2. Add anamorphic elements (crossed cylinders or biconic) and match footprint aspect to FOV W/H
 - Free variables: radii (incl. Ry), thickness, air gaps, apertures, first-vertex Z; optional conic k & A4
-- Objective: FOV power/source × (1 + w_u·uniformity) / (1 + w_a·aspect_error)
-- GUI: **Optimize FOV** / OPTIMIZER panel · CLI: `python optimizer.py --two-phase --extra-lenses 2 --anamorphic crossed`
+- CLI: `python optimizer.py --two-phase --extra-lenses 2 --anamorphic crossed`
 
 ### Performance (NVIDIA Warp)
 - When `warp-lang` is installed and a CUDA GPU is present, the bulk Monte-Carlo deposit runs as a parallel `@wp.kernel`.

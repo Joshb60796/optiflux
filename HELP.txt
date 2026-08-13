@@ -13,18 +13,20 @@ HEADER CONTROLS
 Trace rays
   Run (or re-run) the ray-trace simulation with the current parameters.
 
-Optimize FOV
-  Tunes the *current* enabled lens group (radii, thickness, air gaps,
-  apertures, Z) to improve FOV flux and uniformity. Does not add lenses or
-  force a rectangular reshape. For rectangular FOV design (coverage + min
-  spill, optional anamorphics), use the left-panel Optimizer section.
-
 Auto-run
-  When checked, parameter changes schedule a new trace after a short delay.
+  When checked, a new ray-trace starts after you release the mouse on a
+  slider or side-view handle (or after a button / dropdown click).
+  Dragging still updates lens geometry live (shape, convexity, position);
+  the Monte Carlo map does not start until the pointer is up.
 
 Export STL / Export STEP
   Write CAD files of the current lens surfaces for 3D printing or machining.
-  Coordinates are in millimetres.
+  Coordinates are in millimetres. Mesh density is set in Optics → CAD export
+  (max vertex length and max facet angle). Optional print flanges (radial
+  width and axial thickness) are added to the CAD only — they are not in
+  the ray-trace. A companion *_tube.txt lists each element OD, flange
+  thickness, groove-center Z, groove center-to-center, source-to-tube-front,
+  and last-groove-to-focus (Target Z).
 
 Reset defaults
   Restore factory starting parameters and re-trace.
@@ -41,14 +43,16 @@ Save / Load design
 
 3D view
   Header button: opens an interactive isometric 3D window of the source,
-  lens stack, absorbing blockers, target plane, and FOV outline. Optical
-  +Z (light) points to the right. Left-drag to rotate; right-drag to zoom
+  lens stack, absorbing blockers, target plane, and FOV outline. Opens
+  like the Target Plane: Y vertical, +X toward you (down-right), +Z
+  receding (top-right). Left-drag to rotate; right-drag to zoom
   (matplotlib toolbar also available). Update refreshes after parameter
   changes; sample ray paths appear when a trace has been run.
 
 
 Help
-  Opens this document in a scrollable window.
+  Opens this document in a scrollable window. Laser n calibration has
+  its own “How to calibrate…” button under Optics.
 
 
 --------------------------------------------------------------------------
@@ -63,14 +67,19 @@ Pitch X / Pitch Y
   Centre-to-centre spacing of dies in a COB array (mm).
 
 Die width / Die height
-  Physical size of each emitting rectangle (mm).
+  Physical size of each emitting rectangle (mm). Range is 0.1–50 mm so
+  large modules (for example a 35×35 mm LED) can be entered.
 
 Source Z
   Axial position of the emitter plane (mm). Usually 0.
 
 Half-angle
-  Lambertian-like emission cone half-angle (degrees). Larger values mean
-  wider spread before the lens.
+  Hard cutoff of the emission cone (degrees). Inside that cone the source
+  is Lambertian: radiance is uniform, so intensity falls as cos(θ). That
+  puts more rays (and more power) near the optical axis than at the rim
+  of the cone — that is correct LED physics, not a sampling bug. The
+  side view draws the first segment of every stored ray so the cone
+  rim stays visible even when those rays miss the lens.
 
 Wavelength
   Design wavelength in nanometres (nm). Used for refractive index lookup.
@@ -89,12 +98,86 @@ MLA (micro-lens array)
 OPTICS (LENS STACK)
 --------------------------------------------------------------------------
 
-Element 1 … Element 5
-  Up to five sequential lenses along +Z. Disabled elements are ignored.
+Element 1 … Element 8
+  Up to eight sequential lenses along +Z. Disabled elements are ignored.
   Use collapse controls to hide unused slots.
 
 Enabled
   Include this element in the ray-trace and CAD export.
+
+--------------------------------------------------------------------------
+LASER n CALIBRATION (PRINTED RESIN)
+--------------------------------------------------------------------------
+
+Open Optics → Laser n calibration, or press “How to calibrate…” there.
+The coaxial (centered) shot does not determine n. It only sets the origin
+on the card. n comes from how far the dot moves when you shift the laser
+sideways without tilting it. OptiFlux traces the same +Z pencil the
+simulator uses (Snell at every surface).
+
+What you need
+  The printed lens or group whose radii and thicknesses match the loaded
+  design (measure center thickness if you can). A laser pointer — red
+  ≈ 650 nm, green ≈ 532 nm, HeNe = 632.8 nm. A card you can mark, a
+  ruler, and a way to keep the beam parallel to +Z. Never look into the
+  beam or a reflection off the lens.
+
+Coordinate reminder
+  Light travels +Z. X is horizontal, Y is vertical (Target Plane). All
+  values are millimetres. Laser Z is the pointer (usually 0). Screen /
+  card Z is the card on the same axis (Target Z if the card is at the
+  design throw).
+
+Setup
+  Load the printed design. Hold the first vertex toward the laser.
+  Place the card square to the axis at a known Z, not right at the
+  focus — the dot should still move when you change height.
+
+Step 1 — coaxial (alignment)
+  Aim +Z through the center. Mark the dot. If that mark is your origin,
+  Coaxial dot X and Y are 0. If the card already has axes, enter the
+  measured coaxial X and Y. The fit subtracts this reading.
+
+Step 2 — shift the laser
+  Translate the pointer by a known X and/or Y (for example +5 mm in Y).
+  Do not tilt. Enter Laser offset X and Y. Stay inside the clear
+  aperture, not on the rim.
+
+Step 3 — mark the shifted dot
+  Measure the new dot in the same axes. Enter Shifted dot X and Y.
+  Confirm Laser Z, Screen Z, and wavelength.
+
+Step 4 — Fit n
+  Press “Fit n from laser dots”. A good residual is a fraction of a
+  millimetre. Element 1 lensmaker EFL is shown as a check.
+
+Step 5 — Apply
+  Press “Apply fitted n to Custom / Formlabs”. Writes Custom n and
+  switches Formlabs / Custom elements to Custom. Catalog glass is
+  unchanged.
+
+If the fit looks wrong
+  Large residual: Screen Z or axes are inconsistent. n far from
+  1.50–1.58 for Clear: printed thickness or radii do not match the
+  file. On-axis only: you must shift. Do not tilt the pointer. If the
+  card is at the focus, move it — the dot will not move with n.
+
+This is one n at one wavelength. It does not include scatter, layer
+lines, polish haze, or beam width.
+
+Lock circular outline (Y = X)
+  Keeps the clear aperture round so a circular tube can hold the lens.
+  On by default. Turn off only if you need an elliptical outline.
+  Surface mode (cylinder / biconic) is unchanged — only the outer shape
+  is forced circular. Set each element’s semi-aperture if you want
+  different ODs; the flange radial width is then added on export.
+
+Copy from
+  Dropdown on each element. Pick another slot (for example Element 1) to
+  copy its radii, thickness, apertures, material, and surface mode onto
+  this slot and enable it. The copy sits after the previous enabled
+  element’s “Air gap after” — set that gap on the source lens to space
+  the duplicate.
 
 Lens type
   Library starting shapes (plano-convex, biconvex, …) that set R1/R2 signs
@@ -156,6 +239,9 @@ FOV center X / Y
 
 Map half-width / half-height
   Extent of the recorded irradiance map (mm). Should be larger than the FOV.
+  Zooming the target plane is a camera only: you can pull back onto a
+  multi-metre virtual wall, but the recorded map and collection stay on
+  this rectangle. Hits outside the map stay visible as individual rays.
 
 Map resolution
   Number of bins across the map width (higher = smoother, slower).
@@ -177,7 +263,9 @@ SIMULATION
 --------------------------------------------------------------------------
 
 Rays to trace
-  Monte Carlo sample count for the irradiance map.
+  Monte Carlo sample count for the target-plane irradiance map. The
+  simulation splits this count across progressive batches. Raise map
+  resolution as well if the heatmap still looks blocky after more rays.
 
 Side-view ray paths
   How many individual ray polylines to store for the side view and for
@@ -202,25 +290,32 @@ collapse. All sections start collapsed when the program opens so the panel
 stays short; expand only what you need. A vertical scrollbar on the right
 edge of the panel scrolls the full list of sections.
 
-Lens Element 1…5 still collapse individually inside Optics (same as before).
+Lens Element 1…8 still collapse individually inside Optics (same as before).
 
 
 --------------------------------------------------------------------------
-OPTIMIZER (left panel · rectangular FOV)
+OPTIMIZER (left panel — all optimization lives here)
 --------------------------------------------------------------------------
 
-Objective
-  Maximize even coverage of the rectangular FOV (flux × coverage ×
-  profile fill × uniformity) while minimizing light outside the FOV
-  (spill on the target plane and waste not in the FOV).
+Goal
+  Rectangular FOV fill — pack light into the FOV rectangle (optional
+  anamorphic extras if you allow adding lenses).
+  Sharpest focus — make the illumination border as crisp as possible
+  (does not add lenses).
+  Maximum evenness — flatten irradiance from edge to edge of the FOV
+  (does not add lenses).
 
-Two-phase rectangular
-  Phase 1 improves even FOV fill on the current stack. Phase 2 can add
-  anamorphic elements to match FOV aspect, then keeps phase 1 if the
-  extras do not improve FOV flux.
+Allow adding lenses
+  Off by default. When on, rectangular fill injects extra elements
+  (crossed cylinders / biconic / relays) up to the max extra slider
+  and keeps them unless the extra-lens stack collapses the FOV. A
+  small drop in collection from extra surfaces is expected. The stack
+  still cannot exceed 8 elements.
 
-Extra anamorphic lenses
-  0 = none; 1 = biconic singlet; 2 = crossed cylinders (X then Y).
+Max extra lenses
+  0–8. 1 = biconic singlet; 2 = crossed cylinders (X then Y);
+  3+ adds relay / field elements. Unused if the goal is focus or
+  evenness, or if “Allow adding lenses” is off.
 
 Aspect-match / fill / uniformity weights
   How strongly the score penalizes wrong footprint aspect, under-sized
@@ -235,14 +330,21 @@ METRICS (READOUTS)
 --------------------------------------------------------------------------
 
 Collection efficiency
-  Power that reaches the map (any location) divided by source power.
+  Power inside the rectangular FOV divided by source power. Light that
+  only hits the target plane outside the FOV (including the zoomed-out
+  wall) is not collected.
 
 FOV flux (fraction)
-  Power inside the rectangular FOV divided by source power.
+  Of the light recorded on the heatmap, the fraction that landed inside
+  the rectangular FOV.
 
 Uniformity
   1 − coefficient of variation of irradiance inside the FOV (higher is more
   even). Alternate definitions may use min/max.
+
+Illumination edge sharpness
+  Mean irradiance gradient along the half-max contour of the target-plane
+  map (higher = crisper border). This is what “Sharpest focus” maximizes.
 
 Footprint aspect σx/σy
   Power-weighted second-moment width ratio of the illuminated pattern.
@@ -304,12 +406,18 @@ Side views (Y–Z and X–Z)
   Release the mouse to re-trace.
 
 3D isometric view
-  Header “3D view” — source, lenses, blockers, target plane, FOV, and
-  sample rays in a rotatable 3D scene.
+  Header “3D view” — night optical bench: glowing LED chip, glass lens
+  shells, and the same target-plane irradiance map as the main window
+  painted on a phosphor screen. Purple frame = FOV. Left-drag rotate,
+  right-drag zoom. Update refreshes after a trace; Log map matches the
+  main-window log scale. Reset camera returns to the Y-up three-quarter
+  view (from +X / −Z).
 
 Target plane (X–Y)
   Irradiance map at Target Z. Purple rectangle = FOV. White cross = power
-  centroid. Scroll / right-drag as in the side view.
+  centroid. Scroll / right-drag as in the side view. Zoom does not grow
+  the recorded map; display-path hits stay drawn so rays remain visible
+  when you zoom in.
 
 Profiles panel (left of target plane)
   Always-visible line cuts along X (Y=0), Y (X=0), and the XY diagonal, with
@@ -318,6 +426,24 @@ Profiles panel (left of target plane)
 Buy list
   Commercial-style lens parameters (diameters, radii, thickness, material,
   estimated EFL) for quoting from catalog suppliers.
+
+
+--------------------------------------------------------------------------
+CAD EXPORT (Optics panel · 3D print quality)
+--------------------------------------------------------------------------
+
+Max vertex length (mm)
+  Longest allowed edge between adjacent mesh vertices on the clear
+  aperture. Smaller values (0.10–0.20 mm) hide print facets; 0.25 mm
+  is a good starting point. Larger values make smaller, coarser files.
+
+Max facet angle (°)
+  Largest allowed angle between neighbouring facets on a curved surface.
+  1–2° is typical for a smooth print; 5–10° is a preview mesh.
+
+The panel shows the resulting ring × segment count, rim spacing, and
+triangle estimate. Both STL and STEP use this tessellation (STEP is
+exported as a triangulated solid). Settings are saved with the design.
 
 
 --------------------------------------------------------------------------
@@ -347,7 +473,8 @@ TIPS
 
 • Start with one element, Trace, then enable more elements only if needed.
 • For rectangular FOV, try “Crossed cylinders” or “Biconic singlet”, then
-  Optimize FOV with a modest evaluation budget.
+  open OPTIMIZER, pick Rectangular FOV fill, and run Optimize. Leave
+  “Allow adding lenses” off unless you want extra anamorphic elements.
 • If the footprint looks 90° rotated, use Swap anamorphic X↔Y or Rotate
   optics 90° vs FOV.
 • Increase rays (15k–50k) before trusting uniformity numbers.

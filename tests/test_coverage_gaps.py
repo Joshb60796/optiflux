@@ -302,28 +302,75 @@ class TestCollectionBound(unittest.TestCase):
     def test_no_optics_still_reaches_target_plane(self):
         """
         Without lenses, Lambertian rays still hit the target plane.
-        Collection must count plane hits outside the map window
-        (missed_power), not only bins inside the map — otherwise
-        removing all optics falsely reports ~0% collection.
+        Plane power (map + missed) must stay high; collection is FOV-only
+        and must *not* treat the whole plane as collected light.
         """
         p = _single_lens_params(total_rays=2000)
         for e in p["elements"]:
             e["enabled"] = False
-        # Small map so most unfocused power lands *outside* the window
         p["map_half_w"] = 8.0
         p["map_half_h"] = 6.0
+        p["fov_width"] = 4.0
+        p["fov_height"] = 3.0
         r = run_simulation(p)
         self.assertEqual(r.stats["n_surfaces"], 0)
         self.assertLessEqual(r.stats["collection"], 1.0 + 1e-9)
-        # Near all forward rays reach the plane → collection ≈ 1, not ≈ 0
-        self.assertGreater(
-            r.stats["collection"],
-            0.85,
-            "no-optics collection must count target-plane hits outside the map",
-        )
+        src = max(float(r.stats["source_power"]), 1e-30)
+        plane_frac = float(r.stats.get("plane_power", 0.0)) / src
+        self.assertGreater(plane_frac, 0.7)
         self.assertGreater(r.stats.get("missed_power", 0.0), 0.0)
-        # Map-only power is a small fraction when the beam is unfocused
-        self.assertLess(r.stats["map_power"], 0.5 * r.stats["source_power"])
+        self.assertLess(r.stats["map_power"], 0.5 * src)
+        self.assertLess(
+            r.stats["collection"],
+            0.35,
+            "collection must be FOV/source, not the whole target plane",
+        )
+        self.assertLess(r.stats["collection"], 0.5 * plane_frac)
+
+    def test_collection_ignores_plane_hits_outside_fov(self):
+        """A deposit entirely outside the FOV is plane power, not collection."""
+        m = IrradianceMap(50.0, 40.0, 32, 26)
+        m.deposit(45.0, 0.0, 5.0)
+        p = default_params()
+        p["fov_width"] = 10.0
+        p["fov_height"] = 10.0
+        p["fov_cx"] = 0.0
+        p["fov_cy"] = 0.0
+        st = _finalize_stats(
+            m,
+            launched=100,
+            hit=10,
+            total_f=5.0,
+            surfaces=[],
+            active=[],
+            params=p,
+            batch_i=1,
+            n_batches=1,
+        )
+        self.assertAlmostEqual(st["plane_power"], 5.0, places=5)
+        self.assertLess(st["collection"], 0.05)
+
+    def test_collection_counts_only_power_inside_fov(self):
+        m = IrradianceMap(50.0, 40.0, 32, 26)
+        m.deposit(0.0, 0.0, 4.0)
+        m.deposit(45.0, 0.0, 4.0)
+        p = default_params()
+        p["fov_width"] = 20.0
+        p["fov_height"] = 16.0
+        st = _finalize_stats(
+            m,
+            launched=80,
+            hit=40,
+            total_f=8.0,
+            surfaces=[],
+            active=[],
+            params=p,
+            batch_i=1,
+            n_batches=1,
+        )
+        # Half the power is in the FOV; the other half is still on the plane.
+        self.assertAlmostEqual(st["plane_power"], 8.0, places=5)
+        self.assertAlmostEqual(st["collection"], 0.5, places=5)
 
 
 # ═══════════════════════════════════════════════════════════════════════════

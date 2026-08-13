@@ -6,8 +6,14 @@ lens radii, thicknesses, air gaps, apertures, and first-vertex Z.
 
 Optional **two-phase rectangular** mode:
   Phase 1 — even illumination in the FOV (flux + uniformity; circular OK)
-  Phase 2 — inject 1–4 elements (crossed cylinders, optional relay/biconic) and
+  Phase 2 — inject extra elements (crossed cylinders, optional relay/biconic) and
             match footprint aspect σx/σy to the FOV width/height ratio
+  Extra lenses are opt-in (`allow_extra_lenses`) and stack-capped.
+
+Goals (`OptimizeConfig.objective`):
+  rect_fill — filled rectangle (default)
+  focus     — sharpest illumination border
+  evenness  — flattest FOV irradiance
 
 Uses SciPy differential evolution + optional Nelder–Mead polish.
 
@@ -63,9 +69,13 @@ class OptimizeConfig:
     #   Phase 1 — rotational (or current) optics → even light in FOV
     #   Phase 2 — add N anamorphic lenses → reshape footprint to FOV W/H
     two_phase: bool = False
-    extra_anamorphic_lenses: int = 2  # 0–4 additional elements in phase 2
+    extra_anamorphic_lenses: int = 2  # 0–8 additional elements in phase 2 (stack-capped)
     anamorphic_mode: str = "crossed"  # "crossed" | "biconic"
     phase1_eval_fraction: float = 0.45  # share of max_evals for phase 1
+    # Goal: "rect_fill" | "focus" | "evenness"
+    objective: str = "rect_fill"
+    # When False, never inject extra elements (even if two_phase / extra > 0)
+    allow_extra_lenses: bool = True
     # Which free variables to include
     optimize_radii: bool = True
     optimize_thickness: bool = True
@@ -99,6 +109,97 @@ class OptimizeResult:
     message: str = ""
     elapsed_s: float = 0.0
     phase: str = ""  # "", "1", "2", "1+2"
+
+
+_OBJECTIVE_ALIASES = {
+    "rectangular": "rect_fill",
+    "rect": "rect_fill",
+    "rect_fill": "rect_fill",
+    "sharp": "focus",
+    "sharp_focus": "focus",
+    "focus": "focus",
+    "even": "evenness",
+    "evenness": "evenness",
+    "uniform": "evenness",
+}
+
+
+def normalize_objective(name: str) -> str:
+    key = str(name or "rect_fill").strip().lower().replace(" ", "_")
+    return _OBJECTIVE_ALIASES.get(key, "rect_fill")
+
+
+def config_from_panel(
+    *,
+    objective: str = "rect_fill",
+    allow_extra_lenses: bool = False,
+    extra_lenses: int = 0,
+    anamorphic_mode: str = "crossed",
+    rays_per_eval: int = 2500,
+    max_evals: int = 80,
+    uniformity_weight: float = 0.9,
+    aspect_weight: float = 1.5,
+    fill_weight: float = 2.0,
+    polish: bool = True,
+    optimize_asphere: bool = False,
+    seed: int = 42,
+) -> OptimizeConfig:
+    """
+    Build an OptimizeConfig from the left-panel optimizer controls.
+
+    Extra lenses are only injected for rectangular fill when the user
+    explicitly allows it. Focus / evenness never add elements.
+    """
+    from engine import MAX_ELEMENTS
+
+    obj = normalize_objective(objective)
+    extra_req = max(0, min(int(extra_lenses), 8, MAX_ELEMENTS - 1))
+    allow = bool(allow_extra_lenses) and obj == "rect_fill" and extra_req >= 1
+    extra = extra_req if allow else 0
+    two_phase = allow
+
+    if obj == "focus":
+        uni_w = max(0.0, float(uniformity_weight) * 0.3)
+        asp_w = 0.0
+        fill_w = max(0.4, float(fill_weight) * 0.5)
+        cov = 0.55
+        spill = 0.6
+        waste = 0.4
+    elif obj == "evenness":
+        uni_w = max(1.2, float(uniformity_weight))
+        asp_w = 0.0
+        fill_w = max(1.0, float(fill_weight))
+        cov = 0.95
+        spill = 1.2
+        waste = 0.6
+    else:
+        uni_w = float(uniformity_weight)
+        asp_w = float(aspect_weight)
+        fill_w = float(fill_weight)
+        cov = 0.95
+        spill = 2.0
+        waste = 1.0
+
+    return OptimizeConfig(
+        rays_per_eval=int(rays_per_eval),
+        max_evals=int(max_evals),
+        uniformity_weight=uni_w,
+        aspect_weight=asp_w,
+        fill_weight=fill_w,
+        coverage_mix=cov,
+        spill_weight=spill,
+        waste_weight=waste,
+        two_phase=two_phase,
+        extra_anamorphic_lenses=extra,
+        allow_extra_lenses=allow,
+        anamorphic_mode=str(anamorphic_mode or "crossed"),
+        polish=bool(polish),
+        optimize_asphere=bool(optimize_asphere),
+        optimize_lens_z=True,
+        force_cpu=True,
+        seed=int(seed),
+        objective=obj,
+    )
 
 
 # ── Parameter packing ─────────────────────────────────────────────────────────
@@ -243,7 +344,7 @@ def build_variable_list(
                 _Var(
                     f"elements.{i}.aperture",
                     max(1.5, ap * 0.5),
-                    min(40.0, max(ap * 1.8, ap + 5.0)),
+                    min(80.0, max(ap * 2.2, ap + 12.0, 20.0)),
                 )
             )
             if e.get("aperture_y") is not None:
@@ -252,7 +353,7 @@ def build_variable_list(
                     _Var(
                         f"elements.{i}.aperture_y",
                         max(1.5, apy * 0.5),
-                        min(40.0, max(apy * 1.8, apy + 5.0)),
+                        min(80.0, max(apy * 2.2, apy + 12.0, 20.0)),
                     )
                 )
 
@@ -374,18 +475,18 @@ def inject_anamorphic_lenses(
     from materials_catalog import material_name_from_id
 
     p = copy.deepcopy(params)
-    # Up to 4 extra slots (collector + 4 = 5 = MAX_ELEMENTS)
-    n_extra = max(0, min(int(n_extra), 4))
+    from engine import MAX_ELEMENTS, pad_elements
+
+    # Up to MAX_ELEMENTS-1 extras after the collector (8-slot stack → 7 extras)
+    n_extra = max(0, min(int(n_extra), MAX_ELEMENTS - 1))
     if n_extra < 1:
         return p
-
-    from engine import MAX_ELEMENTS, pad_elements
 
     elements = pad_elements(list(p.get("elements") or []), MAX_ELEMENTS)
 
     # Keep only the primary phase-1 collector enabled as the base optic.
     # Extra enabled elements from a previous run would otherwise stack with the
-    # new anamorphics (4+ surfaces → Fresnel loss, lower collection).
+    # new anamorphics (many surfaces → Fresnel loss, lower collection).
     enabled_idx = [i for i, e in enumerate(elements) if e.get("enabled", True)]
     if not enabled_idx:
         elements[0]["enabled"] = True
@@ -420,6 +521,27 @@ def inject_anamorphic_lenses(
         custom_n=float(p.get("custom_n", 1.5)),
     )
 
+    def _relay(scale: float) -> Dict[str, Any]:
+        R = max(36.0, ap0 * 3.5) * float(scale)
+        return {
+            "enabled": True,
+            "shape_id": "custom",
+            "surface_mode": "rotational",
+            "R1": R,
+            "R2": -R * 0.9,
+            "R1y": None,
+            "R2y": None,
+            "thickness": max(2.2, t0 * 0.55),
+            "air_after": 1.2,
+            "aperture": ap0,
+            "aperture_y": None,
+            "material": mat,
+            "k1": 0.0,
+            "k2": 0.0,
+            "A4_1": 0.0,
+            "A4_2": 0.0,
+        }
+
     seeds: List[Dict[str, Any]] = []
     prefer_crossed = mode.lower().startswith("cross")
 
@@ -448,27 +570,7 @@ def inject_anamorphic_lenses(
         design = design_crossed_cylinders_for_rect_fov(**kwargs)
         seeds = [design["elements"][0], design["elements"][1]]
         if n_extra >= 3:
-            # Weak positive relay — helps homogenize without dominating power
-            seeds.append(
-                {
-                    "enabled": True,
-                    "shape_id": "custom",
-                    "surface_mode": "rotational",
-                    "R1": max(40.0, ap0 * 4.0),
-                    "R2": -max(40.0, ap0 * 4.0),
-                    "R1y": None,
-                    "R2y": None,
-                    "thickness": max(2.5, t0 * 0.6),
-                    "air_after": 1.5,
-                    "aperture": ap0,
-                    "aperture_y": None,
-                    "material": mat,
-                    "k1": 0.0,
-                    "k2": 0.0,
-                    "A4_1": 0.0,
-                    "A4_2": 0.0,
-                }
-            )
+            seeds.append(_relay(1.0))
         if n_extra >= 4:
             design_b = design_biconic_singlet_for_rect_fov(
                 **{
@@ -488,6 +590,8 @@ def inject_anamorphic_lenses(
                 }
             )
             seeds.append(design_b["elements"][0])
+        for scale in (1.25, 0.8, 1.55, 0.65)[: max(0, n_extra - 4)]:
+            seeds.append(_relay(scale))
         seeds = seeds[:n_extra]
 
     # Only use free (disabled) slots after the collector — never grow past
@@ -575,6 +679,8 @@ def evaluate_fov_flux(
     orientation_flipped = float(fov.get("orientation_flipped", 0.0))
     # Line-cut fill (X & Y profiles through FOV centre) — matches the profile plot
     profile_fill = float(fov.get("profile_fill", coverage))
+    edge_sharpness = float(fov.get("edge_sharpness", 0.0) or 0.0)
+    objective = str(getattr(cfg, "objective", "rect_fill") or "rect_fill").lower()
 
     # Require *area* fill + *line-cut* fill + *evenness*. A thin bright streak
     # through FOV centre scores high on flux but low on coverage/uniformity.
@@ -588,6 +694,25 @@ def evaluate_fov_flux(
     # Containment: of all plane power, how much is inside FOV (1 = no spill on plane)
     containment = power_in / max(plane_power, 1e-30) if plane_power > 1e-30 else 0.0
     contain_factor = 0.35 + 0.65 * min(1.0, max(0.0, containment))
+
+    if objective == "focus":
+        # Sharp illumination border. Keep a flux floor so the field does not
+        # collapse to a dark / vanishing speckle.
+        flux_keep = 0.2 + 0.8 * min(1.0, fov_flux / 0.35)
+        size_keep = 1.0 / (1.0 + 1.2 * max(0.0, 0.22 - coverage))
+        score = max(0.0, edge_sharpness) * flux_keep * size_keep
+        score -= _geometry_penalty(p, cfg.penalty_scale)
+        return score, fov_flux, uniformity, collection, aspect_error, footprint_aspect
+
+    if objective == "evenness":
+        uni_even = (0.08 + 0.92 * uniformity) ** max(0.8, min(2.2, 0.7 + w_u))
+        score = uni_even * fill_factor * contain_factor
+        w_s = float(cfg.fill_weight)
+        if w_s > 0:
+            score = score / (1.0 + w_s * size_error)
+        score -= _geometry_penalty(p, cfg.penalty_scale)
+        return score, fov_flux, uniformity, collection, aspect_error, footprint_aspect
+
     score = fov_flux * fill_factor * uni_factor * contain_factor
     w_a = float(cfg.aspect_weight)
     if w_a > 0:
@@ -849,6 +974,47 @@ def _optimize_once(
     )
 
 
+def select_two_phase_winner(
+    r1: OptimizeResult,
+    r2: OptimizeResult,
+    cfg: Optional[OptimizeConfig] = None,
+) -> Tuple[OptimizeResult, str]:
+    """
+    Choose phase-1 or phase-2 after a two-phase rectangular search.
+
+    Rectangular fill asked for extra anamorphic lenses. Extra surfaces
+    almost always cost a little FOV flux (Fresnel). Discarding P2 for
+    that dip leaves a single rotational lens and a round beam. Keep P2
+    whenever it actually added elements, unless the FOV went dark.
+    """
+    objective = str(getattr(cfg, "objective", "rect_fill") or "rect_fill").lower()
+    n1 = sum(
+        1
+        for e in (r1.params or {}).get("elements", [])
+        if e.get("enabled", True)
+    )
+    n2 = sum(
+        1
+        for e in (r2.params or {}).get("elements", [])
+        if e.get("enabled", True)
+    )
+    flux1 = float(r1.fov_flux or 0.0)
+    flux2 = float(r2.fov_flux or 0.0)
+    collapsed = flux2 < max(0.02, 0.35 * flux1)
+
+    if objective == "rect_fill":
+        if collapsed:
+            return r1, "1"
+        if n2 > n1:
+            return r2, "1+2"
+        return (r2, "1+2") if r2.score >= r1.score else (r1, "1")
+
+    keep_p2 = flux2 >= flux1 * 0.98 and (
+        r2.score >= r1.score * 0.95 or flux2 > flux1
+    )
+    return (r2, "1+2") if keep_p2 else (r1, "1")
+
+
 def optimize_fov_flux(
     params: Optional[Dict[str, Any]] = None,
     cfg: Optional[OptimizeConfig] = None,
@@ -867,7 +1033,15 @@ def optimize_fov_flux(
     base = copy.deepcopy(params if params is not None else default_params())
     cfg = cfg or OptimizeConfig()
 
-    if not cfg.two_phase or int(cfg.extra_anamorphic_lenses) < 1:
+    objective = str(getattr(cfg, "objective", "rect_fill") or "rect_fill").lower()
+    allow_extra = bool(getattr(cfg, "allow_extra_lenses", True))
+    if objective != "rect_fill":
+        allow_extra = False
+    if (
+        not cfg.two_phase
+        or not allow_extra
+        or int(cfg.extra_anamorphic_lenses) < 1
+    ):
         return _optimize_once(base, cfg, label="")
 
     # ── Phase 1: even light in FOV (ignore aspect) ──────────────────────────
@@ -902,13 +1076,11 @@ def optimize_fov_flux(
     cfg2.aspect_weight = max(float(cfg.aspect_weight), 1.5)
     cfg2.uniformity_weight = max(float(cfg.uniformity_weight), 0.15)
     cfg2.optimize_asphere = bool(cfg.optimize_asphere)
-    # Only free the newly injected anamorphic slots (+ their air gaps / apertures)
-    slots = seeded.pop("_anamorphic_slots", None)
-    if slots:
-        # Free anamorphic elements; keep phase-1 collector radii fixed but still
-        # move the whole group along Z (lens_z_start) so the FOV fill can be sized.
-        cfg2.optimize_element_indices = list(slots)
-        cfg2.optimize_lens_z = True
+    # Move the whole enabled stack (collector + extras). Freezing the
+    # collector left a round beam that the extra cylinders could not reshape.
+    seeded.pop("_anamorphic_slots", None)
+    cfg2.optimize_element_indices = None
+    cfg2.optimize_lens_z = True
 
     r2 = _optimize_once(
         seeded,
@@ -923,15 +1095,8 @@ def optimize_fov_flux(
     elapsed = r1.elapsed_s + r2.elapsed_s
     history = list(r1.history) + list(r2.history)
 
-    # Keep phase-1 if anamorphics did not improve FOV power. Extra surfaces always
-    # cost Fresnel; only accept P2 when it actually delivers more FOV flux
-    # (small tolerance for MC noise).
-    keep_p2 = r2.fov_flux >= r1.fov_flux * 0.98 and (
-        r2.score >= r1.score * 0.95 or r2.fov_flux > r1.fov_flux
-    )
-    best = r2 if keep_p2 else r1
-    phase = "1+2" if keep_p2 else "1"
-    note = "" if keep_p2 else " · kept P1 (extra lenses did not improve FOV flux)"
+    best, phase = select_two_phase_winner(r1, r2, cfg)
+    note = "" if phase == "1+2" else " · kept P1 (extra-lens stack collapsed FOV flux)"
     msg = (
         f"Two-phase done in {elapsed:.1f}s · {total_evals} evals · "
         f"FOV flux={best.fov_flux * 100:.1f}% · uniformity={best.uniformity * 100:.1f}% · "
@@ -974,7 +1139,7 @@ def _cli() -> int:
         "--extra-lenses",
         type=int,
         default=2,
-        help="Extra elements to add in phase 2 (0–4; 2=crossed pair, 3–4=+relay)",
+        help="Extra elements to add in phase 2 (0–8; 2=crossed pair, 3+=relays)",
     )
     ap.add_argument(
         "--anamorphic",
@@ -993,7 +1158,7 @@ def _cli() -> int:
         uniformity_weight=args.uniformity_weight,
         aspect_weight=args.aspect_weight,
         two_phase=bool(args.two_phase),
-        extra_anamorphic_lenses=max(0, min(4, args.extra_lenses)),
+        extra_anamorphic_lenses=max(0, min(8, args.extra_lenses)),
         anamorphic_mode=args.anamorphic,
         seed=args.seed,
         polish=not args.no_polish,

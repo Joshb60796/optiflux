@@ -69,10 +69,10 @@ def _base_sim(**kw):
 
 
 class TestElementStack(unittest.TestCase):
-    def test_default_has_five_slots(self):
+    def test_default_has_eight_slots(self):
         p = default_params()
         self.assertEqual(len(p["elements"]), MAX_ELEMENTS)
-        self.assertEqual(MAX_ELEMENTS, 5)
+        self.assertEqual(MAX_ELEMENTS, 8)
         self.assertTrue(p["elements"][0]["enabled"])
         self.assertFalse(any(e["enabled"] for e in p["elements"][1:]))
 
@@ -121,6 +121,7 @@ class TestFovMetrics(unittest.TestCase):
             "profile_fill",
             "profile_fill_x",
             "profile_fill_y",
+            "edge_sharpness",
         ):
             self.assertIn(key, fov)
             self.assertTrue(math.isfinite(float(fov[key])), msg=key)
@@ -598,6 +599,31 @@ class TestProgressiveDisplayPaths(unittest.TestCase):
         )
         self.assertEqual(len(r_small[-1].paths), 40)
         self.assertEqual(len(r_large[-1].paths), 120)
+
+    def test_display_paths_use_full_die_extent(self):
+        """Side-view rays must launch from the real die, not a 25% shrink."""
+        p = _base_sim()
+        p["source"]["die_width"] = 30.0
+        p["source"]["die_height"] = 30.0
+        p["elements"][0]["enabled"] = False
+        last = []
+        run_simulation_progressive(
+            p,
+            batch_cb=lambda res, _bi, _n: last.append(res),
+            n_batches=1,
+            rays_per_batch=80,
+            display_per_batch=200,
+        )
+        self.assertGreaterEqual(len(last), 1)
+        xs = [float(path.history[0][0]) for path in last[-1].paths if path.history]
+        ys = [float(path.history[0][1]) for path in last[-1].paths if path.history]
+        self.assertGreater(len(xs), 40)
+        # 30 mm die → origins span ~30 mm. The old display bias scaled x,y by 0.25
+        # (span ≈ 7.5 mm), which looked like “rays only from ±5 mm”.
+        self.assertGreater(max(xs) - min(xs), 18.0)
+        self.assertGreater(max(ys) - min(ys), 18.0)
+        self.assertLess(max(abs(x) for x in xs), 15.1)
+        self.assertLess(max(abs(y) for y in ys), 15.1)
 
 
 # ═══════════════════════════════════════════════════════════════════════════

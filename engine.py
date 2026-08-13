@@ -1175,6 +1175,28 @@ class IrradianceMap:
         g = np.array(self.bins, dtype=float).reshape(self.ny, self.nx)
         return g
 
+    def edge_sharpness(self) -> float:
+        """
+        Mean irradiance gradient on the half-max contour of the whole map,
+        divided by peak so a one-bin step is ~1 and a soft blob is lower.
+        Used to focus so the illumination border is as crisp as possible.
+        """
+        import numpy as np
+
+        g = self.as_grid()
+        if g.size == 0:
+            return 0.0
+        peak = float(np.max(g))
+        if peak <= 1e-30:
+            return 0.0
+        gy, gx = np.gradient(g)
+        mag = np.hypot(gx, gy)
+        norm = g / peak
+        edge = (norm >= 0.25) & (norm <= 0.75)
+        if not np.any(edge):
+            return float(np.max(mag) / peak)
+        return float(np.mean(mag[edge]) / peak)
+
     def centroid(self) -> Tuple[float, float, float]:
         dx = 2 * self.half_w / self.nx
         dy = 2 * self.half_h / self.ny
@@ -1329,6 +1351,7 @@ class IrradianceMap:
                 "profile_fill": 0.0,
                 "profile_fill_x": 0.0,
                 "profile_fill_y": 0.0,
+                "edge_sharpness": self.edge_sharpness(),
             }
         mean_e = sum_e / n_bins
         var_e = sum_e2 / n_bins - mean_e * mean_e
@@ -1406,6 +1429,7 @@ class IrradianceMap:
             "profile_fill": profile_fill,
             "profile_fill_x": profile_fill_x,
             "profile_fill_y": profile_fill_y,
+            "edge_sharpness": self.edge_sharpness(),
         }
 
 
@@ -1612,6 +1636,25 @@ def trace_ray(
     return False, None, power, _path("bounce_limit")
 
 
+def target_plane_hits(
+    paths: List[RayPath],
+    target_z: float,
+    z_tol: float = 1.5,
+) -> List[Tuple[float, float]]:
+    """(X, Y) of every display-path endpoint that reached the target plane."""
+    hits: List[Tuple[float, float]] = []
+    tz = float(target_z)
+    for path in paths:
+        hist = getattr(path, "history", None) or []
+        if len(hist) < 1:
+            continue
+        pt = hist[-1]
+        if abs(float(pt[2]) - tz) > z_tol and getattr(path, "terminated", "") != "target":
+            continue
+        hits.append((float(pt[0]), float(pt[1])))
+    return hits
+
+
 @dataclass
 class SimResult:
     map: IrradianceMap
@@ -1783,15 +1826,15 @@ def run_simulation(params: Dict[str, Any], progress_cb=None) -> SimResult:
         )
         efl = lensmaker_f(float(e0["R1"]), float(e0["R2"]), n_use, float(e0["thickness"]))
 
-    # Collection = power that reaches the target *plane* / source power.
-    # Rays that hit the plane outside the irradiance-map window still count
-    # (tracked as missed_power). Without this, removing all lenses looks like
-    # ~0% collection simply because the beam is larger than the map.
+    # Collection = power inside the rectangular FOV / source power.
+    # Hits anywhere else on the infinite target plane (including the
+    # zoomed-out wall) stay in plane_power / missed_power, not collection.
     plane_power = float(imap.total_power) + float(getattr(imap, "missed_power", 0.0) or 0.0)
+    fov_power = float(fov.get("power_in", 0.0) or 0.0)
     stats = {
         "launched": launched,
         "hit": hit,
-        "collection": plane_power / total_f if total_f > 0 else 0.0,
+        "collection": fov_power / total_f if total_f > 0 else 0.0,
         "rms": imap.rms_radius(),
         "ee50": imap.encircled_radius(0.5),
         "ee86": imap.encircled_radius(0.86),
@@ -1834,6 +1877,7 @@ def _empty_stats() -> Dict[str, Any]:
             "aspect_error": 0.0,
             "sig_x": 0.0,
             "sig_y": 0.0,
+            "edge_sharpness": 0.0,
         },
         "source_power": 0.0,
         "map_power": 0.0,
@@ -1848,7 +1892,10 @@ def _empty_stats() -> Dict[str, Any]:
     }
 
 
-MAX_ELEMENTS = 5
+MAX_ELEMENTS = 8
+MAX_EXTRA_LENSES = 8  # optimizer may add this many; stack still caps at MAX_ELEMENTS
+SOURCE_DIE_MIN_MM = 0.1
+SOURCE_DIE_MAX_MM = 50.0  # large COB / flood LED modules (e.g. 35×35 mm)
 
 
 # Canonical starter optic — Element 1 and every unused slot share this geometry
@@ -1870,7 +1917,23 @@ DEFAULT_ELEMENT: Dict[str, Any] = {
     "R1y": None,
     "R2y": None,
     "aperture_y": None,
+    "circular_lock": True,
 }
+
+
+def apply_circular_outline(element: Dict[str, Any], locked: Optional[bool] = None) -> Dict[str, Any]:
+    """
+    Force a round clear aperture so a circular tube can hold the lens.
+
+    When locked, ``aperture_y`` is cleared (engine then uses aperture for both
+    meridians). Optical surface mode is unchanged — only the outline is round.
+    """
+    e = dict(element)
+    lock = bool(e.get("circular_lock", True) if locked is None else locked)
+    e["circular_lock"] = lock
+    if lock:
+        e["aperture_y"] = None
+    return e
 
 
 def blank_element(
@@ -1903,6 +1966,60 @@ def pad_elements(elements: List[Dict[str, Any]], n: int = MAX_ELEMENTS) -> List[
     return out[:n]
 
 
+_COPY_ELEMENT_KEYS = (
+    "R1",
+    "R2",
+    "R1y",
+    "R2y",
+    "thickness",
+    "air_after",
+    "aperture",
+    "aperture_y",
+    "circular_lock",
+    "material",
+    "shape_id",
+    "surface_mode",
+    "mode_s1",
+    "mode_s2",
+    "k1",
+    "k2",
+    "k1y",
+    "k2y",
+    "A4_1",
+    "A4_2",
+    "A4_1y",
+    "A4_2y",
+)
+
+
+def copy_element(elements: List[Dict[str, Any]], src: int, dst: int) -> List[Dict[str, Any]]:
+    """
+    Return a new stack where slot ``dst`` is a copy of slot ``src``.
+
+    The destination is enabled. Axial placement is not stored on the element;
+    it follows the stack: dest sits after the previous *enabled* element's
+    ``air_after`` (typically the source's air gap when dest is the next slot).
+    """
+    out = [dict(e) for e in (elements or [])]
+    if src < 0 or dst < 0 or src >= len(out) or dst >= len(out):
+        raise IndexError(f"copy_element src={src} dst={dst} n={len(out)}")
+    if src == dst:
+        return out
+    src_e = out[src]
+    dest = dict(out[dst])
+    for key in _COPY_ELEMENT_KEYS:
+        if key in src_e:
+            val = src_e[key]
+            dest[key] = dict(val) if isinstance(val, dict) else val
+        elif key in dest:
+            # Drop dest-only optional fields the source does not have
+            if key in ("R1y", "R2y", "aperture_y", "k1y", "k2y", "A4_1y", "A4_2y"):
+                dest[key] = src_e.get(key)
+    dest["enabled"] = True
+    out[dst] = dest
+    return out
+
+
 def default_params() -> Dict[str, Any]:
     return {
         "source": {
@@ -1929,10 +2046,7 @@ def default_params() -> Dict[str, Any]:
         "elements": [
             # Element 1 only enabled; remaining slots match the same starter optic
             {**dict(DEFAULT_ELEMENT), "enabled": True},
-            blank_element(),
-            blank_element(),
-            blank_element(),
-            blank_element(),
+            *[blank_element() for _ in range(MAX_ELEMENTS - 1)],
         ],
         "lens_z_start": 3.0,
         "custom_n": 1.5,
@@ -1948,9 +2062,13 @@ def default_params() -> Dict[str, Any]:
         "fov_aspect_lock": True,
         "map_half_w": 50.0,
         "map_half_h": 40.0,
+        "cad_flange_radial_mm": 2.0,
+        "cad_flange_thickness_mm": 1.5,
         "map_res": 96,
         "total_rays": 6000,
         "display_rays": 300,
+        "cad_max_edge_mm": 0.25,
+        "cad_max_angle_deg": 2.0,
         "mla": {
             "enabled": False,
             "fill_factor": 0.88,

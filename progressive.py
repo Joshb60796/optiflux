@@ -51,6 +51,7 @@ def _empty_stats() -> Dict[str, Any]:
             "aspect_error": 0.0,
             "sig_x": 0.0,
             "sig_y": 0.0,
+            "edge_sharpness": 0.0,
         },
         "source_power": 0.0,
         "map_power": 0.0,
@@ -120,7 +121,8 @@ def _finalize_stats(
     n_avg = max(int(batch_i), 1)
     map_power_avg = imap.total_power / n_avg
     missed_avg = float(getattr(imap, "missed_power", 0.0) or 0.0) / n_avg
-    # Plane collection includes hits outside the map window (unfocused beams).
+    # Plane power still includes hits outside the map window (unfocused beams).
+    # Collection is FOV-only so zooming the wall does not inflate the readout.
     plane_power_avg = map_power_avg + missed_avg
     peak_avg = imap.max_irradiance() / n_avg
     if "power_in" in fov:
@@ -131,11 +133,12 @@ def _finalize_stats(
         for k in ("min_e", "max_e", "mean_e"):
             if k in fov:
                 fov[k] = float(fov[k]) / n_avg
+    fov_power_avg = float(fov.get("power_in", 0.0) or 0.0)
 
     return {
         "launched": launched,
         "hit": hit,
-        "collection": plane_power_avg / total_f if total_f > 0 else 0.0,
+        "collection": fov_power_avg / total_f if total_f > 0 else 0.0,
         "rms": imap.rms_radius(),
         "ee50": imap.encircled_radius(0.5),
         "ee86": imap.encircled_radius(0.86),
@@ -194,7 +197,7 @@ def _trace_cpu_batch(
         o, d, pwr, wl = die.spawn_ray(power_per)
         # When this batch exists only to build side-view paths (n_display ≈ n_rays),
         # store every ray until the budget is filled. Otherwise sample randomly.
-        display_only = (not accumulate_map) and n_display >= max(1, int(0.5 * n_rays))
+        # Never move origins or bend directions — a 30 mm die must launch from ±15 mm.
         if n_display >= n_rays:
             store = len(paths) < n_display
         else:
@@ -202,18 +205,6 @@ def _trace_cpu_batch(
                 random.random() < (n_display / max(n_rays, 1)) * 1.4
                 or len(paths) < min(40, n_display)
             )
-        # Display-only batch: mild bias toward both meridional planes so the
-        # Y–Z and X–Z side views are both populated. Map stats stay unbiased.
-        if display_only and store:
-            ox, oy, oz = o
-            # Keep emission near the die centre (both meridians)
-            o = (0.25 * ox, 0.25 * oy, oz)
-            dx, dy, dz = d
-            # Soften both transverse components equally (not only X)
-            dx *= 0.35
-            dy *= 0.35
-            nrm = math.sqrt(dx * dx + dy * dy + dz * dz) or 1.0
-            d = (dx / nrm, dy / nrm, dz / nrm)
         ok, pt, pwr_out, path = trace_ray(
             o,
             d,
@@ -267,6 +258,21 @@ def _inject_warp_grid(imap: IrradianceMap, warp_grid, warp_stats) -> Tuple[int, 
     hit = int(warp_stats.get("hit", 0))
     backend = str(warp_stats.get("backend", "warp"))
     return launched, hit, backend
+
+
+def map_ray_budget(total_rays: int, n_batches: int = 5) -> Tuple[int, int]:
+    """
+    Split the user-requested ``total_rays`` across progressive batches.
+
+    Returns ``(n_batches, rays_per_batch)`` so ``n_batches * rays_per_batch``
+    is at least ``total_rays``. The GUI must use this instead of a fixed
+    5000-rays-per-batch default, or the “Rays to trace” slider has no effect
+    on the target-plane map.
+    """
+    batches = max(1, int(n_batches))
+    total = max(1, int(total_rays))
+    rpb = max(1, int(math.ceil(total / batches)))
+    return batches, rpb
 
 
 def run_simulation_progressive(

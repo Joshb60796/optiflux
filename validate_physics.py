@@ -36,6 +36,14 @@ def run_all(*, with_coverage: bool = False):
     import test_ray_path_integrity  # noqa: F401
     import test_features_extended  # noqa: F401
     import test_coverage_gaps  # noqa: F401
+    import test_optimizer_panel  # noqa: F401
+    import test_cad_tessellation  # noqa: F401
+    import test_ui_live_edit  # noqa: F401
+    import test_copy_element  # noqa: F401
+    import test_target_zoom  # noqa: F401
+    import test_cad_flange  # noqa: F401
+    import test_laser_calibrate  # noqa: F401
+    import test_design_io  # noqa: F401
 
     loader = unittest.TestLoader()
     suite = unittest.TestSuite()
@@ -47,6 +55,14 @@ def run_all(*, with_coverage: bool = False):
     suite.addTests(loader.loadTestsFromModule(test_ray_path_integrity))
     suite.addTests(loader.loadTestsFromModule(test_features_extended))
     suite.addTests(loader.loadTestsFromModule(test_coverage_gaps))
+    suite.addTests(loader.loadTestsFromModule(test_optimizer_panel))
+    suite.addTests(loader.loadTestsFromModule(test_cad_tessellation))
+    suite.addTests(loader.loadTestsFromModule(test_ui_live_edit))
+    suite.addTests(loader.loadTestsFromModule(test_copy_element))
+    suite.addTests(loader.loadTestsFromModule(test_target_zoom))
+    suite.addTests(loader.loadTestsFromModule(test_cad_flange))
+    suite.addTests(loader.loadTestsFromModule(test_laser_calibrate))
+    suite.addTests(loader.loadTestsFromModule(test_design_io))
     runner = unittest.TextTestRunner(verbosity=2)
     result = runner.run(suite)
 

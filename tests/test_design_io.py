@@ -8,7 +8,7 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from engine import default_params
+from engine import MAX_ELEMENTS, default_params
 from design_io import save_design, load_design, design_document
 
 
@@ -36,7 +36,7 @@ class TestDesignIO(unittest.TestCase):
         self.assertEqual(p2["elements"][1]["surface_mode"], "cylinder_y")
         self.assertTrue(p2["elements"][0]["enabled"])
         self.assertTrue(p2["elements"][1]["enabled"])
-        self.assertEqual(len(p2["elements"]), 5)
+        self.assertEqual(len(p2["elements"]), MAX_ELEMENTS)
 
     def test_bare_params_legacy(self):
         p = default_params()
