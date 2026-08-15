@@ -63,6 +63,7 @@ from export_cad import (
     build_lens_specs_from_params,
     export_lens,
     export_lens_cnc_profile,
+    export_polish_lap,
     tessellation_for_specs,
     tessellation_from_tolerance,
 )
@@ -74,7 +75,7 @@ from rect_fov import (
     set_fov_from_aspect,
 )
 from optimizer import OptimizeConfig, config_from_panel, optimize_fov_flux
-from focus import focus_group_on_target, map_half_covering_fov
+from focus import focus_group_on_target, group_z_bounds, map_half_covering_fov
 
 
 # ── Theme ────────────────────────────────────────────────────────────────────
@@ -176,6 +177,11 @@ class LiveEditGate:
 def should_start_trace(*, auto_run: bool, live: bool, handle_drag: bool) -> bool:
     """Ray-trace only when Auto-run is on and the pointer is not held down."""
     return bool(auto_run) and not bool(live) and not bool(handle_drag)
+
+
+def group_slider_limits(params: Dict[str, Any]) -> tuple:
+    """Z range for the under-plot group bar: stack stays between source and target."""
+    return group_z_bounds(params)
 
 
 def should_draw_display_rays(*, auto_run: bool, dragging: bool, preview: bool) -> bool:
@@ -746,6 +752,8 @@ class OptiFluxApp(tk.Tk):
         self.v_pol_revs = tk.DoubleVar(value=float(self.params.get("cad_polish_revs", 2.0)))
         self.v_pol_surf = tk.StringVar(value=str(self.params.get("cad_polish_surface", "front")))
         self.v_pol_strat = tk.StringVar(value=str(self.params.get("cad_polish_strategy", "helical")))
+        self.v_lap_surf = tk.StringVar(value=str(self.params.get("cad_lap_surface", "front")))
+        self.v_lap_wall = tk.DoubleVar(value=float(self.params.get("cad_lap_wall_mm", 6.0)))
         self.v_las_wl = tk.DoubleVar(value=float(self.params.get("source", {}).get("wavelength_nm", 650.0)))
         if self.v_las_wl.get() < 400:
             self.v_las_wl.set(650.0)
@@ -948,7 +956,7 @@ class OptiFluxApp(tk.Tk):
         side_tools.pack(side="top", fill="x", padx=8)
         ttk.Label(
             side_tools,
-            text="Y–Z + X–Z: lens=centre/rim/purple · FOV=violet bar ends · pan=right-drag · dbl-click=reset",
+            text="Y–Z + X–Z: lens=centre/rim/purple · group bar=whole stack · FOV=violet · pan=right-drag · dbl-click=reset",
             style="Dim.TLabel",
         ).pack(side="left")
         ttk.Button(side_tools, text="Reset side zoom", command=self._reset_side_zoom).pack(
@@ -967,6 +975,7 @@ class OptiFluxApp(tk.Tk):
         self._connect_side_mouse()
         # Optional separate zoom for the X–Z transverse axis
         self._side_xz_ylim: Optional[Tuple[float, float]] = None
+        self._build_group_z_bar(center)
 
         bot = tk.Frame(center, bg=BG)
         bot.pack(side="top", fill="both", expand=True)
@@ -1967,6 +1976,43 @@ class OptiFluxApp(tk.Tk):
             command=self.export_cnc_profile,
         ).pack(fill="x", padx=6, pady=4)
 
+        lap = ttk.LabelFrame(cad_box, text="Polish lap (cylindrical abrasive tool)")
+        lap.pack(fill="x", padx=4, pady=4)
+        ttk.Label(
+            lap,
+            text=(
+                "Cylinder with the negative of the optical face — coat with "
+                "abrasive and spin the lens or the tool. Opposite end is a "
+                "blind 1/4-20 tap (#7 / 5.10 mm drill, tap after printing)."
+            ),
+            style="Dim.TLabel",
+            wraplength=270,
+        ).pack(anchor="w", padx=6, pady=2)
+        row_l = ttk.Frame(lap)
+        row_l.pack(fill="x", padx=6, pady=2)
+        ttk.Label(row_l, text="Face", style="Dim.TLabel").pack(side="left")
+        ttk.Combobox(
+            row_l,
+            textvariable=self.v_lap_surf,
+            values=("front", "rear", "both"),
+            state="readonly",
+            width=8,
+        ).pack(side="left", padx=4)
+        self._add_slider(
+            lap,
+            "Wall beyond clear aperture (mm)",
+            self.v_lap_wall,
+            2.0,
+            20.0,
+            0.1,
+            command=False,
+        )
+        ttk.Button(
+            lap,
+            text="Export polish lap STL…",
+            command=self.export_polish_lap_stl,
+        ).pack(fill="x", padx=6, pady=4)
+
         self._add_slider(opt, "First vertex Z (mm)", self.v_lens_z, LENS_Z_MIN_MM, LENS_Z_MAX_MM, 0.1)
         self._add_slider(opt, "Custom material n", self.v_custom_n, 1.3, 2.5, 0.001)
 
@@ -2467,6 +2513,9 @@ class OptiFluxApp(tk.Tk):
             p["cad_polish_revs"] = float(self.v_pol_revs.get())
             p["cad_polish_surface"] = str(self.v_pol_surf.get())
             p["cad_polish_strategy"] = str(self.v_pol_strat.get())
+        if hasattr(self, "v_lap_surf"):
+            p["cad_lap_surface"] = str(self.v_lap_surf.get())
+            p["cad_lap_wall_mm"] = float(self.v_lap_wall.get())
         p["blockers"] = [dict(b) for b in self.blockers]
         return p
 
@@ -2492,6 +2541,10 @@ class OptiFluxApp(tk.Tk):
                 pass
         try:
             self._refresh_fov_overlay()
+        except Exception:
+            pass
+        try:
+            self._sync_group_z_bar()
         except Exception:
             pass
 
@@ -2825,6 +2878,99 @@ class OptiFluxApp(tk.Tk):
         self._side_cid["motion"] = c.mpl_connect("motion_notify_event", self._on_side_motion)
         self._side_cid["release"] = c.mpl_connect("button_release_event", self._on_side_release)
         self._side_cid["scroll"] = c.mpl_connect("scroll_event", self._on_side_scroll)
+
+    def _build_group_z_bar(self, parent):
+        """Horizontal bar under both side views: move the whole lens group on Z."""
+        bar = tk.Frame(parent, bg=BG2, highlightbackground=BORDER, highlightthickness=1)
+        bar.pack(side="top", fill="x", padx=8, pady=(0, 4))
+        ttk.Label(
+            bar,
+            text="Lens group Z",
+            style="Dim.TLabel",
+        ).pack(side="left", padx=(8, 6), pady=4)
+        self._group_z_label = tk.StringVar(value="")
+        ttk.Label(bar, textvariable=self._group_z_label, style="Dim.TLabel").pack(
+            side="right", padx=(4, 8)
+        )
+        lo, hi = 0.5, 100.0
+        try:
+            lo, hi = group_slider_limits(self.params)
+        except Exception:
+            pass
+        self._group_z_scale = tk.Scale(
+            bar,
+            from_=lo,
+            to=hi,
+            orient="horizontal",
+            variable=self.v_lens_z,
+            resolution=0.1,
+            showvalue=False,
+            bg=BG2,
+            fg=FG_BRIGHT,
+            troughcolor="#020617",
+            activebackground=ACCENT,
+            highlightthickness=0,
+            bd=0,
+            sliderrelief="flat",
+            width=12,
+        )
+        self._group_z_scale.pack(side="left", fill="x", expand=True, padx=4, pady=2)
+        self._group_z_scale.bind("<ButtonPress-1>", self._on_group_z_press, add="+")
+        self._group_z_scale.bind("<ButtonRelease-1>", self._on_group_z_release, add="+")
+        self._group_z_dragging = False
+        self._syncing_group_z = False
+        self._sync_group_z_bar()
+        self._group_z_scale.configure(command=self._on_group_z_scale)
+
+    def _on_group_z_press(self, _event=None):
+        self._group_z_dragging = True
+        self._begin_live_edit()
+
+    def _on_group_z_release(self, _event=None):
+        if not getattr(self, "_group_z_dragging", False):
+            return
+        self._group_z_dragging = False
+        self._end_live_edit()
+
+    def _on_group_z_scale(self, _=None):
+        if getattr(self, "_syncing_group_z", False):
+            return
+        self._update_group_z_label()
+        self._on_param_change()
+
+    def _update_group_z_label(self):
+        if not hasattr(self, "_group_z_label"):
+            return
+        try:
+            z = float(self.v_lens_z.get())
+        except (TypeError, ValueError, tk.TclError):
+            return
+        self._group_z_label.set(f"{z:.2f} mm  ·  source ← → target")
+
+    def _sync_group_z_bar(self):
+        if not hasattr(self, "_group_z_scale"):
+            return
+        if getattr(self, "_syncing_group_z", False):
+            return
+        try:
+            p = self.collect_params()
+            lo, hi = group_slider_limits(p)
+        except Exception:
+            return
+        try:
+            z = float(self.v_lens_z.get())
+        except (TypeError, ValueError, tk.TclError):
+            z = lo
+        lo_s = min(float(lo), z)
+        hi_s = max(float(hi), z)
+        if hi_s < lo_s + 0.1:
+            hi_s = lo_s + 0.1
+        self._syncing_group_z = True
+        try:
+            self._group_z_scale.configure(from_=lo_s, to=hi_s)
+            self._update_group_z_label()
+        finally:
+            self._syncing_group_z = False
 
     def _side_axes(self):
         """Axes that participate in side-view interaction (Y–Z and X–Z)."""
@@ -5356,6 +5502,9 @@ class OptiFluxApp(tk.Tk):
             self.v_pol_revs.set(float(p.get("cad_polish_revs", 2.0)))
             self.v_pol_surf.set(str(p.get("cad_polish_surface", "front")))
             self.v_pol_strat.set(str(p.get("cad_polish_strategy", "helical")))
+        if hasattr(self, "v_lap_surf"):
+            self.v_lap_surf.set(str(p.get("cad_lap_surface", p.get("cad_polish_surface", "front"))))
+            self.v_lap_wall.set(float(p.get("cad_lap_wall_mm", 6.0)))
         if hasattr(self, "cad_mesh_status"):
             self._refresh_cad_mesh_label()
         # Absorbing panels
@@ -6285,6 +6434,52 @@ class OptiFluxApp(tk.Tk):
                 "X0 = printed flat / flange mid-plane. Y = 0.\n"
                 "Zero X on the cut face, YZ on the A-axis centre.\n"
                 f"Extension is {CNC_PROFILE_EXT} for Candle.",
+            )
+            self.status_var.set(f"Exported {out.name}")
+        except Exception as e:
+            messagebox.showerror("Export failed", str(e))
+
+    def export_polish_lap_stl(self):
+        """Write cylindrical abrasive-lap STL (optical negative + 1/4-20 tap)."""
+        params = self.collect_params()
+        if not any(e.get("enabled") for e in params["elements"]):
+            messagebox.showwarning("Export", "Enable at least one lens element.")
+            return
+        path = filedialog.asksaveasfilename(
+            title="Export polish lap STL (mm)",
+            defaultextension=".stl",
+            filetypes=[("STL file", "*.stl"), ("All", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            edge = float(self.v_cad_edge.get()) if hasattr(self, "v_cad_edge") else 0.25
+            ang = float(self.v_cad_angle.get()) if hasattr(self, "v_cad_angle") else 2.0
+            wall = float(self.v_lap_wall.get()) if hasattr(self, "v_lap_wall") else 6.0
+            surf = str(self.v_lap_surf.get()) if hasattr(self, "v_lap_surf") else "front"
+            out = export_polish_lap(
+                params,
+                path,
+                surface=surf,
+                max_edge_mm=edge,
+                max_angle_deg=ang,
+                wall_mm=wall,
+            )
+            notes = Path(path)
+            if notes.suffix.lower() != ".stl":
+                notes = notes.with_suffix(".stl")
+            note_path = notes.with_name(notes.stem + "_tool.txt")
+            note_line = f"\nTool dimensions: {note_path.name}" if note_path.is_file() else ""
+            extra = ""
+            if surf.lower() == "both":
+                extra = "\nFront and rear faces are separate STL files."
+            messagebox.showinfo(
+                "Export complete",
+                f"Wrote {out}{extra}{note_line}\n\n"
+                "Cylindrical polish lap, millimetres.\n"
+                "Working face = negative of the lens surface (coat with abrasive).\n"
+                "Opposite end = 1/4-20 UNC tap, #7 drill (5.10 mm), 12.7 mm deep.\n"
+                "Tap the hole after printing. Do not break through the optical face.",
             )
             self.status_var.set(f"Exported {out.name}")
         except Exception as e:

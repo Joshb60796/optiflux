@@ -34,6 +34,9 @@ Export STL / Export STEP
   Check “STL as print halves” to cut each lens at the flange mid-plane and
   write *_front.stl / *_rear.stl — a flat build face for resin printing;
   glue the halves with the same photopolymer.
+  Export polish lap writes a cylindrical tool whose working face is the
+  negative of the lens surface (coat with abrasive and spin the lens or
+  the tool). The opposite end has a 1/4-20 tap hole. Default is STL.
   Export 4-axis polish writes GRBL for a spherical tool on A (optical
   axis). Default extension is .nc for Candle.
 
@@ -426,6 +429,10 @@ Side views (Y–Z and X–Z)
   Two stacked meridional cuts share the Z axis:
     • Top (Y–Z) — shows cylinder_y and rotational power in Y
     • Bottom (X–Z) — orthogonal cut; shows cylinder_x and rotational power in X
+  The bar under both plots moves the whole lens group along Z (internal
+  air gaps stay fixed). Left is toward the source; right is toward the
+  target. Same value as Optics → First vertex Z. Drag updates geometry
+  live; release re-traces if Auto-run is on.
   Scroll to zoom; right-drag to pan. Handles on each lens:
     • Yellow centre square — move that lens along Z (neighbours stay fixed)
     • Purple dots on front/rear vertices — drag to set R₁ / R₂
@@ -476,6 +483,17 @@ STL as print halves
   writes *_front.stl and *_rear.stl. Each half has a flat disk on the cut
   so a resin printer can build from that face; glue the halves with the
   same photopolymer.
+
+Export polish lap STL
+  One cylinder per selected face (front / rear / both) and per enabled
+  element. The working end is the negative of that optical surface inside
+  a circular nest (clear aperture + 0.2 mm slip) so the lens can sit on
+  the matching shape. Coat the face with abrasive and spin the lens or
+  the cylinder. The opposite end is a coaxial 1/4-20 UNC hole, modeled
+  as a #7 tap drill (5.105 mm) × 12.7 mm deep — tap after printing.
+  Wall beyond the nest is set by “Wall beyond clear aperture”. A
+  companion *_tool.txt lists OD, length, well ID, and hole size.
+  Coordinates: mount face at Z = 0, optical face toward +Z.
 
 Export 4-axis polish (.nc)
   GRBL program for a mill like the Genmitsu Prover 3030 Ultra with the 4th

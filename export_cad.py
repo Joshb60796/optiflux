@@ -122,6 +122,16 @@ CAD_N_THETA_MAX = 2048
 CAD_DEFAULT_MAX_EDGE_MM = 0.25
 CAD_DEFAULT_MAX_ANGLE_DEG = 2.0
 
+# Cylindrical polish lap: 1/4-20 UNC on the mount face (tap after printing).
+UNC_1_4_20_MAJOR_MM = 6.35
+UNC_1_4_20_TAP_DRILL_MM = 5.105  # #7
+UNC_1_4_20_PITCH_MM = 25.4 / 20.0
+LAP_HOLE_DEPTH_MM = 12.7
+LAP_HOLE_KEEP_MM = 4.0
+LAP_WALL_DEFAULT_MM = 6.0
+LAP_SLIP_DEFAULT_MM = 0.20
+LAP_WELL_EXTRA_MM = 3.0
+
 
 def tessellation_from_tolerance(
     aperture: float,
@@ -753,7 +763,6 @@ def build_lens_specs_from_params(params: Dict[str, Any], dies: Optional[list] = 
     elements = [e for e in params.get("elements", []) if e.get("enabled", True)]
     if not elements:
         return [], "empty"
-    z0 = float(params.get("lens_z_start", 3.0))
     mla = params.get("mla", {}) or {}
     mla_on = bool(mla.get("enabled", False))
 
@@ -763,8 +772,16 @@ def build_lens_specs_from_params(params: Dict[str, Any], dies: Optional[list] = 
         specs, _meta = build_mla_lens_specs(params, dies=dies)
         return specs, "mla"
 
+    specs = stack_singlet_specs(params)
+    mode = "stack" if len(specs) > 1 else "singlet"
+    return specs, mode
+
+
+def stack_singlet_specs(params: Dict[str, Any]) -> List[LensSpec]:
+    """Enabled elements as sequential singlets (MLA ignored)."""
+    elements = [e for e in params.get("elements", []) if e.get("enabled", True)]
+    z = float(params.get("lens_z_start", 3.0))
     specs: List[LensSpec] = []
-    z = z0
     for e in elements:
         r1y = e.get("R1y", None)
         r2y = e.get("R2y", None)
@@ -790,9 +807,7 @@ def build_lens_specs_from_params(params: Dict[str, Any], dies: Optional[list] = 
             )
         )
         z += thick + float(e.get("air_after", 0.0))
-
-    mode = "stack" if len(specs) > 1 else "singlet"
-    return specs, mode
+    return specs
 
 
 def write_step_multibody(path: str | Path, meshes: Sequence[Mesh], name: str = "OptiFlux_Optics") -> Path:
@@ -1820,4 +1835,317 @@ def export_lens(
             notes,
             tube_layout(params, flange_radial_mm=fr, flange_thickness_mm=ft),
         )
+    return written
+
+
+def mesh_signed_volume(mesh: Mesh) -> float:
+    """Signed volume of a closed triangle mesh (positive if windings are outward)."""
+    if mesh.vertices.size == 0 or mesh.faces.size == 0:
+        return 0.0
+    v = np.asarray(mesh.vertices, dtype=np.float64)
+    f = np.asarray(mesh.faces, dtype=np.int32)
+    v0 = v[f[:, 0]]
+    v1 = v[f[:, 1]]
+    v2 = v[f[:, 2]]
+    return float(np.sum(np.einsum("ij,ij->i", v0, np.cross(v1, v2))) / 6.0)
+
+
+def parse_lap_faces(surface: Optional[str]) -> List[str]:
+    s = str(surface or "front").strip().lower()
+    if s in ("both", "all"):
+        return ["front", "rear"]
+    if s in ("rear", "back"):
+        return ["rear"]
+    return ["front"]
+
+
+def lap_jobs(params: Dict[str, Any], surface: Optional[str] = None) -> List[Tuple[int, str]]:
+    """(element_index, face) pairs for polish-lap export."""
+    key = surface
+    if key is None:
+        key = params.get("cad_lap_surface", params.get("cad_polish_surface", "front"))
+    faces = parse_lap_faces(key)
+    specs = stack_singlet_specs(params)
+    return [(i, face) for i in range(len(specs)) for face in faces]
+
+
+def lap_output_paths(
+    path: str | Path,
+    jobs: Sequence[Tuple[int, str]],
+    n_elements: int = 1,
+) -> List[Path]:
+    path = Path(path)
+    if path.suffix.lower() != ".stl":
+        path = path.with_suffix(".stl")
+    job_list = list(jobs)
+    if len(job_list) <= 1:
+        return [path]
+    out: List[Path] = []
+    multi = int(n_elements) > 1
+    for i, face in job_list:
+        if multi:
+            out.append(path.with_name(f"{path.stem}_E{int(i) + 1}_{face}{path.suffix}"))
+        else:
+            out.append(path.with_name(f"{path.stem}_{face}{path.suffix}"))
+    return out
+
+
+def _ring_fan(center: int, ring_start: int, n_t: int, flip: bool = False) -> np.ndarray:
+    faces = []
+    for it in range(n_t):
+        a = ring_start + it
+        b = ring_start + (it + 1) % n_t
+        if flip:
+            faces.append((center, b, a))
+        else:
+            faces.append((center, a, b))
+    return np.array(faces, dtype=np.int32)
+
+
+def mesh_polish_lap(
+    spec: LensSpec,
+    which: str = "front",
+    *,
+    n_radial: int = 48,
+    n_theta: int = 96,
+    wall_mm: float = LAP_WALL_DEFAULT_MM,
+    slip_mm: float = LAP_SLIP_DEFAULT_MM,
+    well_extra_mm: float = LAP_WELL_EXTRA_MM,
+    hole_dia_mm: float = UNC_1_4_20_TAP_DRILL_MM,
+    hole_depth_mm: float = LAP_HOLE_DEPTH_MM,
+    hole_keep_mm: float = LAP_HOLE_KEEP_MM,
+) -> Mesh:
+    """
+    Closed cylindrical lap: optical negative on +Z, 1/4-20 tap from z = 0.
+
+    Local frame: mount face at z = 0, working face toward +Z. The working
+    face is the female of the named optical surface so the lens can nest
+    in a shallow circular well and be spun against abrasive.
+    """
+    which = "rear" if str(which or "front").lower() in ("rear", "back") else "front"
+    ap = max(1e-3, float(spec.aperture))
+    ap_y = spec.aperture_y if spec.aperture_y else ap
+    mode = spec.mode or "rotational"
+    if which == "front":
+        Rx = float(spec.R1)
+        Ry = spec.R1y if spec.R1y is not None else spec.R1
+        kx = float(spec.k1)
+        a4x = float(spec.A4_1)
+    else:
+        Rx = float(spec.R2)
+        Ry = spec.R2y if spec.R2y is not None else spec.R2
+        kx = float(spec.k2)
+        a4x = float(spec.A4_2)
+
+    optical, n_r, n_t = _surface_points(
+        ap,
+        Rx,
+        kx,
+        a4x,
+        0.0,
+        n_radial,
+        n_theta,
+        radius_y=Ry,
+        mode=mode,
+        semi_y=ap_y,
+    )
+    # Front air is −Z, rear air is +Z. Flip so the lap opens toward +Z and
+    # the impression is the negative of the lens face.
+    sign = 1.0 if which == "front" else -1.0
+    signed = sign * optical[:, 2]
+    z_keep = float(hole_depth_mm) + float(hole_keep_mm)
+    z0 = z_keep - float(np.min(signed))
+    optical = optical.copy()
+    optical[:, 2] = z0 + signed
+
+    semi = _clear_semi_mm(ap, ap_y)
+    r_well = semi + max(0.0, float(slip_mm))
+    r_hole = 0.5 * max(1.0, float(hole_dia_mm))
+    r_od = max(r_well + max(1.0, float(wall_mm)), r_hole + 4.0)
+    z_lip = float(np.max(optical[:, 2])) + max(0.2, float(well_extra_mm))
+    z_hole = float(hole_depth_mm)
+
+    rim0 = 1 + (n_r - 1) * n_t
+    rim = optical[rim0 : rim0 + n_t]
+    well_floor = np.zeros((n_t, 3), dtype=np.float64)
+    for it in range(n_t):
+        th = 2.0 * math.pi * it / n_t
+        well_floor[it, 0] = r_well * math.cos(th)
+        well_floor[it, 1] = r_well * math.sin(th)
+        well_floor[it, 2] = float(rim[it, 2])
+
+    well_lip = _circle_ring(r_well, z_lip, n_t)
+    od_lip = _circle_ring(r_od, z_lip, n_t)
+    od_mount = _circle_ring(r_od, 0.0, n_t)
+    hole_mount = _circle_ring(r_hole, 0.0, n_t)
+    hole_bot = _circle_ring(r_hole, z_hole, n_t)
+    hole_ctr = np.array([[0.0, 0.0, z_hole]], dtype=np.float64)
+
+    n_opt = len(optical)
+    i_wf = n_opt
+    i_wl = i_wf + n_t
+    i_ol = i_wl + n_t
+    i_om = i_ol + n_t
+    i_hm = i_om + n_t
+    i_hb = i_hm + n_t
+    i_hc = i_hb + n_t
+    verts = np.vstack(
+        [optical, well_floor, well_lip, od_lip, od_mount, hole_mount, hole_bot, hole_ctr]
+    )
+
+    face_blocks = [
+        _disk_faces(n_r, n_t, flip=False),
+        _edge_faces(n_t, rim0, i_wf, flip=False),
+        _edge_faces(n_t, i_wf, i_wl, flip=True),
+        _edge_faces(n_t, i_wl, i_ol, flip=False),
+        _edge_faces(n_t, i_om, i_ol, flip=False),
+        _edge_faces(n_t, i_hm, i_om, flip=True),
+        _edge_faces(n_t, i_hm, i_hb, flip=True),
+        _ring_fan(i_hc, i_hb, n_t, flip=True),
+    ]
+    faces = np.vstack(face_blocks)
+    mesh = Mesh(verts, faces)
+    if mesh_signed_volume(mesh) < 0.0:
+        mesh = Mesh(verts, faces[:, ::-1].copy())
+    return mesh
+
+
+def format_lap_notes(rows: Sequence[Dict[str, Any]]) -> str:
+    lines = [
+        "OptiFlux polish lap (cylindrical abrasive tool)",
+        "All values in millimetres (mm).",
+        "Working face = negative of the optical surface. Coat with abrasive.",
+        "Opposite end = coaxial 1/4-20 UNC tap, blind.",
+        "Printed hole is #7 tap drill (5.105 mm). Tap 1/4-20 after printing.",
+        f"Hole depth {LAP_HOLE_DEPTH_MM:.2f} mm. Leave ≥ {LAP_HOLE_KEEP_MM:.1f} mm "
+        "of solid between the hole bottom and the optical face.",
+        "",
+    ]
+    for r in rows:
+        lines.append(f"E{int(r['index'])}  {r['face']}")
+        lines.append(f"  Cylinder OD                   {float(r['od_mm']):8.3f}")
+        lines.append(f"  Length                        {float(r['length_mm']):8.3f}")
+        lines.append(f"  Well ID (lens nest)           {float(r['well_id_mm']):8.3f}")
+        lines.append(f"  Clear aperture (optical)      {float(r['ca_mm']):8.3f}")
+        lines.append(f"  Tap drill dia                 {float(r['hole_dia_mm']):8.3f}")
+        lines.append(f"  Hole depth                    {float(r['hole_depth_mm']):8.3f}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def lap_layout_row(
+    spec: LensSpec,
+    which: str,
+    *,
+    wall_mm: float = LAP_WALL_DEFAULT_MM,
+    slip_mm: float = LAP_SLIP_DEFAULT_MM,
+    well_extra_mm: float = LAP_WELL_EXTRA_MM,
+    hole_dia_mm: float = UNC_1_4_20_TAP_DRILL_MM,
+    hole_depth_mm: float = LAP_HOLE_DEPTH_MM,
+    hole_keep_mm: float = LAP_HOLE_KEEP_MM,
+    index: int = 1,
+) -> Dict[str, Any]:
+    which = "rear" if str(which or "front").lower() in ("rear", "back") else "front"
+    ap = max(1e-3, float(spec.aperture))
+    ap_y = spec.aperture_y if spec.aperture_y else ap
+    semi = _clear_semi_mm(ap, ap_y)
+    r_well = semi + max(0.0, float(slip_mm))
+    r_hole = 0.5 * max(1.0, float(hole_dia_mm))
+    r_od = max(r_well + max(1.0, float(wall_mm)), r_hole + 4.0)
+    if which == "front":
+        Rx = float(spec.R1)
+        Ry = spec.R1y if spec.R1y is not None else spec.R1
+        kx, a4x = float(spec.k1), float(spec.A4_1)
+    else:
+        Rx = float(spec.R2)
+        Ry = spec.R2y if spec.R2y is not None else spec.R2
+        kx, a4x = float(spec.k2), float(spec.A4_2)
+    mode = spec.mode or "rotational"
+    samples = []
+    for r in (0.0, 0.5 * semi, semi):
+        s = sag_xy(r, 0.0, Rx, Ry, kx, 0.0, a4x, 0.0, mode)
+        samples.append(0.0 if s is None else float(s))
+    sign = 1.0 if which == "front" else -1.0
+    signed = [sign * s for s in samples]
+    sag_span = max(signed) - min(signed)
+    length = float(hole_depth_mm) + float(hole_keep_mm) + sag_span + max(0.2, float(well_extra_mm))
+    return {
+        "index": int(index),
+        "face": which,
+        "od_mm": 2.0 * r_od,
+        "length_mm": length,
+        "well_id_mm": 2.0 * r_well,
+        "ca_mm": 2.0 * semi,
+        "hole_dia_mm": float(hole_dia_mm),
+        "hole_depth_mm": float(hole_depth_mm),
+    }
+
+
+def export_polish_lap(
+    params: Dict[str, Any],
+    path: str | Path,
+    *,
+    surface: Optional[str] = None,
+    max_edge_mm: Optional[float] = None,
+    max_angle_deg: Optional[float] = None,
+    wall_mm: Optional[float] = None,
+    n_radial: int = 40,
+    n_theta: int = 72,
+) -> Path:
+    """
+    Write one cylindrical polish-lap STL per selected optical face.
+
+    Mount face (z = 0) has a coaxial 1/4-20 tap-drill hole. The opposite
+    end is the negative of the lens surface inside a circular nest.
+    """
+    specs = stack_singlet_specs(params)
+    if not specs:
+        raise ValueError("No enabled lens element to export")
+    jobs = lap_jobs(params, surface=surface)
+    if not jobs:
+        raise ValueError("No polish-lap faces to export")
+
+    edge = (
+        CAD_DEFAULT_MAX_EDGE_MM
+        if max_edge_mm is None
+        else float(max_edge_mm)
+    )
+    ang = (
+        CAD_DEFAULT_MAX_ANGLE_DEG
+        if max_angle_deg is None
+        else float(max_angle_deg)
+    )
+    if max_edge_mm is not None or max_angle_deg is not None:
+        n_radial, n_theta = tessellation_for_specs(
+            specs, max_edge_mm=edge, max_angle_deg=ang
+        )
+    wall = float(
+        wall_mm
+        if wall_mm is not None
+        else params.get("cad_lap_wall_mm", LAP_WALL_DEFAULT_MM)
+    )
+
+    dests = lap_output_paths(path, jobs, n_elements=len(specs))
+    rows: List[Dict[str, Any]] = []
+    written: Optional[Path] = None
+    for dest, (idx, face) in zip(dests, jobs):
+        spec = specs[idx]
+        mesh = mesh_polish_lap(
+            spec,
+            face,
+            n_radial=n_radial,
+            n_theta=n_theta,
+            wall_mm=wall,
+        )
+        write_stl_binary(dest, mesh, solid_name=f"OptiFlux_E{idx + 1}_{face}_lap_mm")
+        rows.append(lap_layout_row(spec, face, wall_mm=wall, index=idx + 1))
+        if written is None:
+            written = dest
+    if written is None:
+        raise RuntimeError("No polish lap to export")
+    base = Path(path)
+    if base.suffix.lower() != ".stl":
+        base = base.with_suffix(".stl")
+    notes = base.with_name(base.stem + "_tool.txt")
+    notes.write_text(format_lap_notes(rows), encoding="utf-8")
     return written

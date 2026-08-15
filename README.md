@@ -33,12 +33,13 @@ In PyCharm: right-click `app.py` → **Run**.
 - Rectangular FOV, irradiance map, RMS / encircled energy, FOV uniformity, aspect match
 
 ### Views
-- Side view (drag lenses on Z, release to re-trace)
+- Side view (drag lenses on Z, group bar moves the whole stack, release to re-trace)
 - Target-plane irradiance heatmap
 
 ### CAD
 - Export **STL** / **STEP** in **mm**
 - Optional **print halves**: split each lens at the flange mid-plane for resin printing
+- **Polish lap** STL: cylindrical tool with the negative of a lens face and a 1/4-20 tap on the opposite end
 - 4-axis **polish** G-code as **`.nc`** (A = optical axis, spherical tool, Candle / GRBL)
 - Print tessellation: **max vertex length** and **max facet angle** (Optics → CAD export)
 

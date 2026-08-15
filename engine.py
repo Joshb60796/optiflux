@@ -2081,6 +2081,8 @@ def default_params() -> Dict[str, Any]:
         "cad_polish_strategy": "helical",
         "cad_polish_x_origin": "cut",
         "cad_polish_y_offset_mm": 0.0,
+        "cad_lap_surface": "front",
+        "cad_lap_wall_mm": 6.0,
         "map_res": 96,
         "total_rays": 6000,
         "display_rays": 300,

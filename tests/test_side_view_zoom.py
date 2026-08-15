@@ -8,10 +8,13 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app import (
+    group_slider_limits,
     resolve_applied_side_limits,
     side_full_extent,
     should_draw_display_rays,
 )
+from engine import default_params
+from focus import group_z_bounds
 
 
 class TestSideFullExtent(unittest.TestCase):
@@ -70,6 +73,23 @@ class TestResolveAppliedSideLimits(unittest.TestCase):
         self.assertAlmostEqual(ylim[0], -35.0)
         self.assertAlmostEqual(ylim[1], 35.0)
         self.assertNotAlmostEqual(ymin, xmin)
+
+
+class TestGroupSliderLimits(unittest.TestCase):
+    def test_matches_group_z_bounds(self):
+        p = default_params()
+        p["source"]["source_z"] = 0.0
+        p["target_z"] = 150.0
+        p["elements"][0].update(enabled=True, thickness=6.0, air_after=2.0)
+        for e in p["elements"][1:]:
+            e["enabled"] = False
+        lo, hi = group_slider_limits(p)
+        blo, bhi = group_z_bounds(p)
+        self.assertAlmostEqual(lo, blo)
+        self.assertAlmostEqual(hi, bhi)
+        self.assertGreater(hi, lo)
+        self.assertGreater(lo, 0.0)
+        self.assertLess(hi, 150.0)
 
 
 class TestShouldDrawDisplayRays(unittest.TestCase):

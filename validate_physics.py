@@ -48,6 +48,7 @@ def run_all(*, with_coverage: bool = False):
     import test_fov_handles  # noqa: F401
     import test_cad_halves  # noqa: F401
     import test_polish_cnc  # noqa: F401
+    import test_polish_lap  # noqa: F401
     import test_focus_group  # noqa: F401
 
     loader = unittest.TestLoader()
@@ -72,6 +73,7 @@ def run_all(*, with_coverage: bool = False):
     suite.addTests(loader.loadTestsFromModule(test_fov_handles))
     suite.addTests(loader.loadTestsFromModule(test_cad_halves))
     suite.addTests(loader.loadTestsFromModule(test_polish_cnc))
+    suite.addTests(loader.loadTestsFromModule(test_polish_lap))
     suite.addTests(loader.loadTestsFromModule(test_focus_group))
     runner = unittest.TextTestRunner(verbosity=2)
     result = runner.run(suite)
