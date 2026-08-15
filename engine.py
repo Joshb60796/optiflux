@@ -1896,6 +1896,11 @@ MAX_ELEMENTS = 8
 MAX_EXTRA_LENSES = 8  # optimizer may add this many; stack still caps at MAX_ELEMENTS
 SOURCE_DIE_MIN_MM = 0.1
 SOURCE_DIE_MAX_MM = 50.0  # large COB / flood LED modules (e.g. 35×35 mm)
+LENS_Z_MIN_MM = 0.2
+LENS_Z_MAX_MM = 1000.0  # first vertex; must reach mid-throw of long benches
+LENS_SEMI_MAX_MM = 80.0
+AIR_AFTER_MAX_MM = 250.0
+FOV_SIZE_MAX_MM = 500.0
 
 
 # Canonical starter optic — Element 1 and every unused slot share this geometry
@@ -1907,7 +1912,7 @@ DEFAULT_ELEMENT: Dict[str, Any] = {
     "thickness": 6.0,
     "air_after": 2.0,
     "aperture": 10.0,
-    "material": "ACRYLIC_PMMA",
+    "material": "FORMLABS_CLEAR",
     "shape_id": "biconvex",
     "surface_mode": "rotational",
     "k1": 0.0,
@@ -2064,6 +2069,18 @@ def default_params() -> Dict[str, Any]:
         "map_half_h": 40.0,
         "cad_flange_radial_mm": 2.0,
         "cad_flange_thickness_mm": 1.5,
+        "cad_export_halves": False,
+        "cad_polish_tool_dia_mm": 10.0,
+        "cad_polish_stepover_mm": 0.3,
+        "cad_polish_allowance_mm": 0.0,
+        "cad_polish_feed_mm_min": 100.0,
+        "cad_polish_retract_mm": 5.0,
+        "cad_polish_rpm": 5000.0,
+        "cad_polish_revs": 2.0,
+        "cad_polish_surface": "front",
+        "cad_polish_strategy": "helical",
+        "cad_polish_x_origin": "cut",
+        "cad_polish_y_offset_mm": 0.0,
         "map_res": 96,
         "total_rays": 6000,
         "display_rays": 300,

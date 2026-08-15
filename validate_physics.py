@@ -44,6 +44,11 @@ def run_all(*, with_coverage: bool = False):
     import test_cad_flange  # noqa: F401
     import test_laser_calibrate  # noqa: F401
     import test_design_io  # noqa: F401
+    import test_side_view_zoom  # noqa: F401
+    import test_fov_handles  # noqa: F401
+    import test_cad_halves  # noqa: F401
+    import test_polish_cnc  # noqa: F401
+    import test_focus_group  # noqa: F401
 
     loader = unittest.TestLoader()
     suite = unittest.TestSuite()
@@ -63,6 +68,11 @@ def run_all(*, with_coverage: bool = False):
     suite.addTests(loader.loadTestsFromModule(test_cad_flange))
     suite.addTests(loader.loadTestsFromModule(test_laser_calibrate))
     suite.addTests(loader.loadTestsFromModule(test_design_io))
+    suite.addTests(loader.loadTestsFromModule(test_side_view_zoom))
+    suite.addTests(loader.loadTestsFromModule(test_fov_handles))
+    suite.addTests(loader.loadTestsFromModule(test_cad_halves))
+    suite.addTests(loader.loadTestsFromModule(test_polish_cnc))
+    suite.addTests(loader.loadTestsFromModule(test_focus_group))
     runner = unittest.TextTestRunner(verbosity=2)
     result = runner.run(suite)
 

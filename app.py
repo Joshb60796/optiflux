@@ -23,6 +23,10 @@ from matplotlib.figure import Figure
 from matplotlib.colors import LinearSegmentedColormap
 
 from engine import (
+    AIR_AFTER_MAX_MM,
+    LENS_SEMI_MAX_MM,
+    LENS_Z_MAX_MM,
+    LENS_Z_MIN_MM,
     MATERIAL_NAMES,
     MAX_ELEMENTS,
     SOURCE_DIE_MAX_MM,
@@ -55,8 +59,10 @@ from lens_shapes import (
     shape_label_from_id,
 )
 from export_cad import (
+    CNC_PROFILE_EXT,
     build_lens_specs_from_params,
     export_lens,
+    export_lens_cnc_profile,
     tessellation_for_specs,
     tessellation_from_tolerance,
 )
@@ -68,6 +74,7 @@ from rect_fov import (
     set_fov_from_aspect,
 )
 from optimizer import OptimizeConfig, config_from_panel, optimize_fov_flux
+from focus import focus_group_on_target, map_half_covering_fov
 
 
 # ── Theme ────────────────────────────────────────────────────────────────────
@@ -169,6 +176,185 @@ class LiveEditGate:
 def should_start_trace(*, auto_run: bool, live: bool, handle_drag: bool) -> bool:
     """Ray-trace only when Auto-run is on and the pointer is not held down."""
     return bool(auto_run) and not bool(live) and not bool(handle_drag)
+
+
+def should_draw_display_rays(*, auto_run: bool, dragging: bool, preview: bool) -> bool:
+    """
+    Individual ray polylines are the side-view cost (thousands of ax.plot calls).
+
+    * Dragging a handle never draws them.
+    * A live preview with Auto-run off never draws them.
+    * A full redraw after an explicit Trace still draws them (preview=False).
+    """
+    if dragging:
+        return False
+    if preview:
+        return bool(auto_run)
+    return True
+
+
+def side_full_extent(z0: float, z1: float, t_y: float, t_x: float) -> tuple:
+    """(zmin, zmax, ymin, ymax, xmin, xmax) for the two stacked side views."""
+    ty = max(float(t_y), 1e-6)
+    tx = max(float(t_x), 1e-6)
+    return (float(z0), float(z1), -ty, ty, -tx, tx)
+
+
+def resolve_applied_side_limits(
+    *,
+    stored_xlim: Optional[tuple],
+    stored_ylim: Optional[tuple],
+    zmin: float,
+    zmax: float,
+    tmin: float,
+    tmax: float,
+    clamp_fn=None,
+) -> tuple:
+    """
+    Limits for one side-view plane.
+
+    A missing ylim must not reset the shared Z window — that was collapsing
+    Y after every progressive batch (X–Z ylim stayed None, set_xlim(full)
+    ran on the shared axis, and the zoomed Y window looked paper-thin).
+    """
+    clamp = clamp_fn
+    if stored_xlim is None:
+        xlim = (float(zmin), float(zmax))
+    else:
+        x0, x1 = float(stored_xlim[0]), float(stored_xlim[1])
+        if clamp is not None:
+            x0, x1 = clamp(x0, x1, zmin, zmax)
+        xlim = (x0, x1)
+    if stored_ylim is None:
+        ylim = (float(tmin), float(tmax))
+    else:
+        y0, y1 = float(stored_ylim[0]), float(stored_ylim[1])
+        if clamp is not None:
+            y0, y1 = clamp(y0, y1, tmin, tmax)
+        ylim = (y0, y1)
+    return xlim, ylim
+
+
+FOV_SIZE_MIN_MM = 5.0
+FOV_SIZE_MAX_MM = 500.0  # matches engine.FOV_SIZE_MAX_MM
+
+
+def clamp_fov_size(v: float) -> float:
+    return max(FOV_SIZE_MIN_MM, min(FOV_SIZE_MAX_MM, float(v)))
+
+
+def resize_fov_from_end(center: float, size: float, new_end: float) -> tuple:
+    """Keep the FOV centre; set the span from a dragged bar end. Returns (center, size)."""
+    return float(center), clamp_fov_size(2.0 * abs(float(new_end) - float(center)))
+
+
+def move_fov_center(cx: float, cy: float, dx: float, dy: float) -> tuple:
+    return float(cx) + float(dx), float(cy) + float(dy)
+
+
+def resize_fov_rect(
+    cx: float,
+    cy: float,
+    w: float,
+    h: float,
+    *,
+    edge: Optional[str] = None,
+    corner: Optional[str] = None,
+    x: float = 0.0,
+    y: float = 0.0,
+    lock_aspect: bool = False,
+) -> tuple:
+    """
+    Resize the target FOV rectangle.
+
+    Edge drags keep the opposite edge. Corner drags keep the opposite corner.
+    Returns (cx, cy, w, h).
+    """
+    x0 = float(cx) - float(w) / 2.0
+    x1 = float(cx) + float(w) / 2.0
+    y0 = float(cy) - float(h) / 2.0
+    y1 = float(cy) + float(h) / 2.0
+    aspect = (x1 - x0) / max(y1 - y0, 1e-9)
+    kind = (corner or edge or "").lower()
+    if kind in ("left", "nw", "sw"):
+        x0 = float(x)
+    if kind in ("right", "ne", "se"):
+        x1 = float(x)
+    if kind in ("bottom", "sw", "se"):
+        y0 = float(y)
+    if kind in ("top", "nw", "ne"):
+        y1 = float(y)
+    if x1 < x0:
+        x0, x1 = x1, x0
+    if y1 < y0:
+        y0, y1 = y1, y0
+    nw = clamp_fov_size(x1 - x0)
+    nh = clamp_fov_size(y1 - y0)
+    ncx = 0.5 * (x0 + x1)
+    ncy = 0.5 * (y0 + y1)
+    # After clamp, re-anchor so the unmoved edge/corner stays put.
+    if kind in ("right", "ne", "se"):
+        ncx = x0 + 0.5 * nw
+    elif kind in ("left", "nw", "sw"):
+        ncx = x1 - 0.5 * nw
+    if kind in ("top", "nw", "ne"):
+        ncy = y0 + 0.5 * nh
+    elif kind in ("bottom", "sw", "se"):
+        ncy = y1 - 0.5 * nh
+    if lock_aspect and aspect > 1e-9 and kind in ("left", "right", "top", "bottom"):
+        if kind in ("left", "right"):
+            nh = clamp_fov_size(nw / aspect)
+        else:
+            nw = clamp_fov_size(nh * aspect)
+    return ncx, ncy, nw, nh
+
+
+def pick_fov_rect_handle(
+    x: float,
+    y: float,
+    cx: float,
+    cy: float,
+    w: float,
+    h: float,
+    *,
+    hit_r: float = 2.0,
+) -> Optional[tuple]:
+    """
+    Return ('corner', name), ('edge', name), ('move', None), or None.
+    Corners win over edges.
+    """
+    x0 = float(cx) - float(w) / 2.0
+    x1 = float(cx) + float(w) / 2.0
+    y0 = float(cy) - float(h) / 2.0
+    y1 = float(cy) + float(h) / 2.0
+    r = max(float(hit_r), 0.4)
+    corners = {
+        "sw": (x0, y0),
+        "se": (x1, y0),
+        "nw": (x0, y1),
+        "ne": (x1, y1),
+    }
+    best = None
+    best_d = r
+    for name, (px, py) in corners.items():
+        d = math.hypot(float(x) - px, float(y) - py)
+        if d <= best_d:
+            best_d = d
+            best = ("corner", name)
+    if best is not None:
+        return best
+    # Edges: near the rectangle boundary, away from the opposite side
+    if abs(float(x) - x1) <= r and y0 - r <= float(y) <= y1 + r:
+        return ("edge", "right")
+    if abs(float(x) - x0) <= r and y0 - r <= float(y) <= y1 + r:
+        return ("edge", "left")
+    if abs(float(y) - y1) <= r and x0 - r <= float(x) <= x1 + r:
+        return ("edge", "top")
+    if abs(float(y) - y0) <= r and x0 - r <= float(x) <= x1 + r:
+        return ("edge", "bottom")
+    if x0 < float(x) < x1 and y0 < float(y) < y1:
+        return ("move", None)
+    return None
 
 
 class SliderRow(ttk.Frame):
@@ -345,6 +531,7 @@ class OptiFluxApp(tk.Tk):
         self._live_slider = None
         self._opt_gen = 0  # bumps to cancel an in-flight optimizer
         self._optimizing = False
+        self._focusing = False
         # Progressive defaults: 5 batches × 5000 map rays + 500 side paths
         self.prog_batches = 5
         self.prog_rays_batch = 5000
@@ -355,12 +542,18 @@ class OptiFluxApp(tk.Tk):
         self._drag: Optional[Dict[str, Any]] = None
         self._element_handles: list = []  # pick targets from last side-view draw
         self._blocker_handles: list = []  # absorb panel pick targets
+        self._fov_side_handles: list = []  # FOV bar ends / body on side views
+        self._fov_tgt_handles: list = []
+        self._fov_tgt_handle_arts: list = []
+        self._fov_rect_patch = None
+        self._side_layout_done = False
+        self._draw_side_preview = False  # True while Auto-run-off geometry refresh
         self._side_cid = {}  # matplotlib event connection ids
         self._view3d_win = None
         # Side-view zoom/pan (Z–Y mm)
         self._side_xlim: Optional[tuple] = None
         self._side_ylim: Optional[tuple] = None
-        self._side_full_extent: Optional[tuple] = None  # (zmin,zmax,ymin,ymax)
+        self._side_full_extent: Optional[tuple] = None  # (zmin,zmax,ymin,ymax,xmin,xmax)
         self._side_pan: Optional[Dict[str, Any]] = None
         # Target-plane view zoom/pan (data limits in mm)
         self._tgt_xlim: Optional[tuple] = None
@@ -543,6 +736,16 @@ class OptiFluxApp(tk.Tk):
         self.v_cad_angle = tk.DoubleVar(value=float(self.params.get("cad_max_angle_deg", 2.0)))
         self.v_cad_flange_r = tk.DoubleVar(value=float(self.params.get("cad_flange_radial_mm", 2.0)))
         self.v_cad_flange_t = tk.DoubleVar(value=float(self.params.get("cad_flange_thickness_mm", 1.5)))
+        self.v_cad_halves = tk.BooleanVar(value=bool(self.params.get("cad_export_halves", False)))
+        self.v_pol_dia = tk.DoubleVar(value=float(self.params.get("cad_polish_tool_dia_mm", 10.0)))
+        self.v_pol_step = tk.DoubleVar(value=float(self.params.get("cad_polish_stepover_mm", 0.3)))
+        self.v_pol_allow = tk.DoubleVar(value=float(self.params.get("cad_polish_allowance_mm", 0.0)))
+        self.v_pol_feed = tk.DoubleVar(value=float(self.params.get("cad_polish_feed_mm_min", 100.0)))
+        self.v_pol_retr = tk.DoubleVar(value=float(self.params.get("cad_polish_retract_mm", 5.0)))
+        self.v_pol_rpm = tk.DoubleVar(value=float(self.params.get("cad_polish_rpm", 5000.0)))
+        self.v_pol_revs = tk.DoubleVar(value=float(self.params.get("cad_polish_revs", 2.0)))
+        self.v_pol_surf = tk.StringVar(value=str(self.params.get("cad_polish_surface", "front")))
+        self.v_pol_strat = tk.StringVar(value=str(self.params.get("cad_polish_strategy", "helical")))
         self.v_las_wl = tk.DoubleVar(value=float(self.params.get("source", {}).get("wavelength_nm", 650.0)))
         if self.v_las_wl.get() < 400:
             self.v_las_wl.set(650.0)
@@ -601,7 +804,12 @@ class OptiFluxApp(tk.Tk):
         ttk.Button(header, text="3D view", command=self.open_3d_view).pack(
             side="right", padx=4, pady=8
         )
-        ttk.Checkbutton(header, text="Auto-run", variable=self.auto_run).pack(side="right", padx=6)
+        ttk.Checkbutton(
+            header,
+            text="Auto-run",
+            variable=self.auto_run,
+            command=self._on_auto_run_toggle,
+        ).pack(side="right", padx=6)
         ttk.Button(header, text="Export STL…", command=lambda: self.export_cad("stl")).pack(
             side="right", padx=4
         )
@@ -740,7 +948,7 @@ class OptiFluxApp(tk.Tk):
         side_tools.pack(side="top", fill="x", padx=8)
         ttk.Label(
             side_tools,
-            text="Y–Z + X–Z: move=centre · size=top/bottom · radius=purple dots · pan=right-drag · dbl-click=reset",
+            text="Y–Z + X–Z: lens=centre/rim/purple · FOV=violet bar ends · pan=right-drag · dbl-click=reset",
             style="Dim.TLabel",
         ).pack(side="left")
         ttk.Button(side_tools, text="Reset side zoom", command=self._reset_side_zoom).pack(
@@ -1068,7 +1276,7 @@ class OptiFluxApp(tk.Tk):
         self._add_slider(body, "R₁ᵧ front (mm) · biconic/cyl Y", ev["R1y"], -200, 200, 0.5)
         self._add_slider(body, "R₂ᵧ rear (mm) · biconic/cyl Y", ev["R2y"], -200, 200, 0.5)
         self._add_slider(body, "Thickness (mm)", ev["thickness"], 0.2, 30, 0.1)
-        self._add_slider(body, "Air gap after (mm)", ev["air_after"], 0, 50, 0.1)
+        self._add_slider(body, "Air gap after (mm)", ev["air_after"], 0, AIR_AFTER_MAX_MM, 0.1)
         self._add_slider(
             body,
             "Semi-aperture X (mm)",
@@ -1705,14 +1913,61 @@ class OptiFluxApp(tk.Tk):
             wraplength=290,
         ).pack(anchor="w", padx=6, pady=(0, 4))
         self._refresh_cad_mesh_label()
+        ttk.Checkbutton(
+            cad_box,
+            text="STL as print halves (cut at flange mid-plane)",
+            variable=self.v_cad_halves,
+        ).pack(anchor="w", padx=6, pady=(0, 2))
         ttk.Button(cad_box, text="Export STL (binary, mm)…", command=lambda: self.export_cad("stl")).pack(
             fill="x", padx=6, pady=2
         )
         ttk.Button(cad_box, text="Export STEP (mm)…", command=lambda: self.export_cad("step")).pack(
             fill="x", padx=6, pady=2
         )
+        pol = ttk.LabelFrame(cad_box, text="4-axis polish (GRBL / Candle)")
+        pol.pack(fill="x", padx=4, pady=4)
+        ttk.Label(
+            pol,
+            text=(
+                "Printed half on A (optical axis along X). "
+                "Spherical abrasive on the vertical spindle approaches radially in Z. "
+                "X0 = flange mid-plane; X+ toward the optical surface. Y = 0."
+            ),
+            style="Dim.TLabel",
+            wraplength=270,
+        ).pack(anchor="w", padx=6, pady=2)
+        row_s = ttk.Frame(pol)
+        row_s.pack(fill="x", padx=6, pady=2)
+        ttk.Label(row_s, text="Face", style="Dim.TLabel").pack(side="left")
+        ttk.Combobox(
+            row_s,
+            textvariable=self.v_pol_surf,
+            values=("front", "rear", "both"),
+            state="readonly",
+            width=8,
+        ).pack(side="left", padx=4)
+        ttk.Label(row_s, text="Path", style="Dim.TLabel").pack(side="left", padx=(8, 0))
+        ttk.Combobox(
+            row_s,
+            textvariable=self.v_pol_strat,
+            values=("helical", "rings"),
+            state="readonly",
+            width=8,
+        ).pack(side="left", padx=4)
+        self._add_slider(pol, "Ball tool diameter (mm)", self.v_pol_dia, 2.0, 30.0, 0.1, command=False)
+        self._add_slider(pol, "Stepover along meridian (mm)", self.v_pol_step, 0.05, 2.0, 0.05, command=False)
+        self._add_slider(pol, "Allowance / extra offset (mm)", self.v_pol_allow, -0.2, 0.5, 0.01, command=False)
+        self._add_slider(pol, "Feed (mm/min)", self.v_pol_feed, 20, 800, 5, command=False)
+        self._add_slider(pol, "A revolutions per ring", self.v_pol_revs, 0.5, 8.0, 0.5, command=False)
+        self._add_slider(pol, "Retract (mm, radial Z)", self.v_pol_retr, 1.0, 30.0, 0.5, command=False)
+        self._add_slider(pol, "Spindle RPM (0 = M3 only)", self.v_pol_rpm, 0, 24000, 100, command=False)
+        ttk.Button(
+            pol,
+            text="Export 4-axis polish (.nc)…",
+            command=self.export_cnc_profile,
+        ).pack(fill="x", padx=6, pady=4)
 
-        self._add_slider(opt, "First vertex Z (mm)", self.v_lens_z, 0.5, 40, 0.1)
+        self._add_slider(opt, "First vertex Z (mm)", self.v_lens_z, LENS_Z_MIN_MM, LENS_Z_MAX_MM, 0.1)
         self._add_slider(opt, "Custom material n", self.v_custom_n, 1.3, 2.5, 0.001)
 
         las = ttk.LabelFrame(opt, text="Laser n calibration (printed resin)")
@@ -1800,9 +2055,9 @@ class OptiFluxApp(tk.Tk):
             style="Dim.TLabel",
             wraplength=290,
         ).pack(anchor="w", padx=6, pady=2)
-        self._add_slider(tgt, "Target distance Z (mm)", self.v_target_z, 20, 1000, 1)
-        self._add_slider(tgt, "FOV width (mm)", self.v_fov_w, 5, 300, 1)
-        self._add_slider(tgt, "FOV height (mm)", self.v_fov_h, 5, 300, 1)
+        self._add_slider(tgt, "Target distance Z (mm)", self.v_target_z, 10, 2000, 1)
+        self._add_slider(tgt, "FOV width (mm)", self.v_fov_w, 5, FOV_SIZE_MAX_MM, 1)
+        self._add_slider(tgt, "FOV height (mm)", self.v_fov_h, 5, FOV_SIZE_MAX_MM, 1)
         self._add_slider(tgt, "FOV aspect W/H", self.v_fov_aspect, 0.25, 4.0, 0.01)
         ttk.Checkbutton(
             tgt,
@@ -1813,8 +2068,23 @@ class OptiFluxApp(tk.Tk):
         self.v_fov_w.trace_add("write", self._on_fov_dim_change)
         self.v_fov_h.trace_add("write", self._on_fov_dim_change)
         self.v_fov_aspect.trace_add("write", self._on_fov_aspect_change)
-        self._add_slider(tgt, "FOV center X (mm)", self.v_fov_cx, -50, 50, 0.5)
-        self._add_slider(tgt, "FOV center Y (mm)", self.v_fov_cy, -50, 50, 0.5)
+        self._add_slider(tgt, "FOV center X (mm)", self.v_fov_cx, -200, 200, 0.5)
+        self._add_slider(tgt, "FOV center Y (mm)", self.v_fov_cy, -200, 200, 0.5)
+        ttk.Button(
+            tgt,
+            text="Focus group on target (image the source)",
+            command=self._focus_group_on_target,
+        ).pack(fill="x", padx=8, pady=(4, 2))
+        ttk.Label(
+            tgt,
+            text=(
+                "Moves the whole lens group along Z so each point on the source "
+                "is imaged as sharply as possible on the FOV plane — like focusing "
+                "a flashlight until the emitter shape appears."
+            ),
+            style="Dim.TLabel",
+            wraplength=290,
+        ).pack(anchor="w", padx=8, pady=(0, 4))
 
         design = ttk.LabelFrame(tgt, text="Design optics for rectangular FOV")
         design.pack(fill="x", padx=6, pady=6)
@@ -2168,6 +2438,12 @@ class OptiFluxApp(tk.Tk):
         p["fov_cy"] = float(self.v_fov_cy.get())
         p["map_half_w"] = float(self.v_map_w.get())
         p["map_half_h"] = float(self.v_map_h.get())
+        # FOV must sit inside the recorded map or collection / fill read empty
+        cov_w, cov_h = map_half_covering_fov(
+            p["fov_width"], p["fov_height"], p["fov_cx"], p["fov_cy"],
+            p["map_half_w"], p["map_half_h"],
+        )
+        p["map_half_w"], p["map_half_h"] = cov_w, cov_h
         p["map_res"] = int(self.v_map_res.get())
         p["total_rays"] = int(self.v_rays.get())
         p["display_rays"] = int(self.v_disp.get())
@@ -2179,21 +2455,72 @@ class OptiFluxApp(tk.Tk):
             p["cad_flange_radial_mm"] = float(self.v_cad_flange_r.get())
         if hasattr(self, "v_cad_flange_t"):
             p["cad_flange_thickness_mm"] = float(self.v_cad_flange_t.get())
+        if hasattr(self, "v_cad_halves"):
+            p["cad_export_halves"] = bool(self.v_cad_halves.get())
+        if hasattr(self, "v_pol_dia"):
+            p["cad_polish_tool_dia_mm"] = float(self.v_pol_dia.get())
+            p["cad_polish_stepover_mm"] = float(self.v_pol_step.get())
+            p["cad_polish_allowance_mm"] = float(self.v_pol_allow.get())
+            p["cad_polish_feed_mm_min"] = float(self.v_pol_feed.get())
+            p["cad_polish_retract_mm"] = float(self.v_pol_retr.get())
+            p["cad_polish_rpm"] = float(self.v_pol_rpm.get())
+            p["cad_polish_revs"] = float(self.v_pol_revs.get())
+            p["cad_polish_surface"] = str(self.v_pol_surf.get())
+            p["cad_polish_strategy"] = str(self.v_pol_strat.get())
         p["blockers"] = [dict(b) for b in self.blockers]
         return p
 
     def _preview_optics(self):
-        """Cheap geometry refresh — no Monte Carlo."""
+        """Geometry-only refresh — no Monte Carlo.
+
+        With Auto-run off this skips ray polylines and CAD remesh estimates
+        so dragging many lenses stays interactive.
+        """
+        auto = bool(self.auto_run.get()) if hasattr(self, "auto_run") else True
         if self.result is not None:
             try:
+                self._draw_side_preview = not auto
                 self._draw_side()
             except Exception:
                 pass
-        if hasattr(self, "cad_mesh_status"):
+            finally:
+                self._draw_side_preview = False
+        if auto and hasattr(self, "cad_mesh_status"):
             try:
                 self._refresh_cad_mesh_label()
             except Exception:
                 pass
+        try:
+            self._refresh_fov_overlay()
+        except Exception:
+            pass
+
+    def _on_auto_run_toggle(self):
+        """Auto-run off must actually stop work — cancel an in-flight trace."""
+        if not bool(self.auto_run.get()):
+            self._cancel_trace_work()
+            self._preview_optics()
+            self.status_var.set("Auto-run off — geometry only. Press Trace rays to simulate.")
+            return
+        self.status_var.set("Auto-run on — traces after edits. Press Trace rays for a map now.")
+
+    def _request_trace_after_edit(self, status: str = "") -> None:
+        """Start a trace only when Auto-run is on and nothing is held down."""
+        if should_start_trace(
+            auto_run=bool(self.auto_run.get()),
+            live=self._live_edit.live,
+            handle_drag=self._drag is not None,
+        ):
+            if status:
+                self.status_var.set(status)
+            self.run_trace()
+            return
+        self._preview_optics()
+        if status:
+            note = status.split("—")[0].strip(" .")
+            if not bool(self.auto_run.get()):
+                note = f"{note} · Auto-run off" if note else "Auto-run off"
+            self.status_var.set(note or "Ready")
 
     def _cancel_trace_work(self):
         """Drop a pending debounce and abort any in-flight progressive trace."""
@@ -2569,24 +2896,32 @@ class OptiFluxApp(tk.Tk):
         """Restore side-view zoom after redraw; allow zoom-out beyond fit view."""
         if self._side_full_extent is None:
             return
-        zmin, zmax, ymin, ymax = self._side_full_extent
+        ext = self._side_full_extent
+        zmin, zmax, ymin, ymax = ext[0], ext[1], ext[2], ext[3]
+        xmin, xmax = (ext[4], ext[5]) if len(ext) > 4 else (ymin, ymax)
         use_xz = str(plane).lower().startswith("x") or ax is getattr(self, "ax_side_xz", None)
-        ylim = self._side_xz_ylim if use_xz else self._side_ylim
-        if self._side_xlim is None or ylim is None:
-            ax.set_xlim(zmin, zmax)
-            ax.set_ylim(ymin, ymax)
-            return
-        x0, x1 = self._side_xlim
-        y0, y1 = ylim
-        x0, x1 = self._clamp_view_window(x0, x1, zmin, zmax)
-        y0, y1 = self._clamp_view_window(y0, y1, ymin, ymax)
-        self._side_xlim = (x0, x1)
-        if use_xz:
-            self._side_xz_ylim = (y0, y1)
-        else:
-            self._side_ylim = (y0, y1)
-        ax.set_xlim(x0, x1)
-        ax.set_ylim(y0, y1)
+        tmin, tmax = (xmin, xmax) if use_xz else (ymin, ymax)
+        stored_y = self._side_xz_ylim if use_xz else self._side_ylim
+        xlim, ylim = resolve_applied_side_limits(
+            stored_xlim=self._side_xlim,
+            stored_ylim=stored_y,
+            zmin=zmin,
+            zmax=zmax,
+            tmin=tmin,
+            tmax=tmax,
+            clamp_fn=self._clamp_view_window,
+        )
+        if self._side_xlim is not None:
+            self._side_xlim = xlim
+        if stored_y is not None:
+            if use_xz:
+                self._side_xz_ylim = ylim
+            else:
+                self._side_ylim = ylim
+        ax.set_xlim(*xlim)
+        ax.set_ylim(*ylim)
+        ax.set_autoscalex_on(False)
+        ax.set_autoscaley_on(False)
 
     def _on_side_scroll(self, event):
         """Mouse wheel zoom on either side view, centered on cursor."""
@@ -2610,11 +2945,14 @@ class OptiFluxApp(tk.Tk):
         new_w = (z1 - z0) * scale
         new_h = (y1 - y0) * scale
         if self._side_full_extent is not None:
-            fz0, fz1, fy0, fy1 = self._side_full_extent
+            ext = self._side_full_extent
+            fz0, fz1, fy0, fy1 = ext[0], ext[1], ext[2], ext[3]
+            fx0, fx1 = (ext[4], ext[5]) if len(ext) > 4 else (fy0, fy1)
+            t0, t1 = (fx0, fx1) if use_xz else (fy0, fy1)
             min_w = max(0.5, 0.02 * (fz1 - fz0))
-            min_h = max(0.2, 0.02 * (fy1 - fy0))
+            min_h = max(0.2, 0.02 * (t1 - t0))
             max_w = (fz1 - fz0) * ZOOM_OUT_MAX
-            max_h = (fy1 - fy0) * ZOOM_OUT_MAX
+            max_h = (t1 - t0) * ZOOM_OUT_MAX
             new_w = max(min_w, min(new_w, max_w))
             new_h = max(min_h, min(new_h, max_h))
         else:
@@ -2769,7 +3107,7 @@ class OptiFluxApp(tk.Tk):
             return None
         return best, best_mode
 
-    def _max_drawable_aperture(self, elem_index: int, ap_request: float = 50.0) -> float:
+    def _max_drawable_aperture(self, elem_index: int, ap_request: float = LENS_SEMI_MAX_MM) -> float:
         """
         Largest semi-aperture that still keeps a positive edge thickness for
         this element's current R1/R2/thickness. Matches what _draw_lens_body
@@ -2777,15 +3115,16 @@ class OptiFluxApp(tk.Tk):
         """
         from engine import build_surfaces, max_aperture_positive_edge
 
+        cap = LENS_SEMI_MAX_MM
         if elem_index < 0 or elem_index >= len(self.elem_vars):
-            return max(1.0, min(50.0, float(ap_request)))
+            return max(1.0, min(cap, float(ap_request)))
         p = self.collect_params()
         # Temporarily request a large aperture so the clamp is geometry-limited
         els = [dict(e) for e in p["elements"]]
         if elem_index >= len(els) or not els[elem_index].get("enabled"):
-            return max(1.0, min(50.0, float(ap_request)))
+            return max(1.0, min(cap, float(ap_request)))
         els[elem_index] = dict(els[elem_index])
-        els[elem_index]["aperture"] = max(float(ap_request), 50.0)
+        els[elem_index]["aperture"] = max(float(ap_request), cap)
         try:
             surfs = build_surfaces(
                 els,
@@ -2794,22 +3133,22 @@ class OptiFluxApp(tk.Tk):
                 None,
             )
         except Exception:
-            return max(1.0, min(50.0, float(ap_request)))
+            return max(1.0, min(cap, float(ap_request)))
         # Surfaces for this element are labeled E{n}S1 / E{n}S2
         label = f"E{elem_index + 1}"
         pair = [s for s in surfs if getattr(s, "label", "").startswith(label)]
         if len(pair) < 2:
-            return max(1.0, min(50.0, float(ap_request)))
+            return max(1.0, min(cap, float(ap_request)))
         s1, s2 = pair[0], pair[1]
-        ap = max_aperture_positive_edge(s1, s2, max(float(ap_request), 50.0), min_edge=0.25)
-        return max(1.0, min(50.0, float(ap)))
+        ap = max_aperture_positive_edge(s1, s2, max(float(ap_request), cap), min_edge=0.25)
+        return max(1.0, min(cap, float(ap)))
 
     def _apply_element_aperture(self, elem_index: int, new_ap: float) -> None:
         """Set semi-aperture (mm) for an element; keep Y in sync when elliptical."""
         if elem_index < 0 or elem_index >= len(self.elem_vars):
             return
         # Clamp to physically drawable size so stored value matches the side view
-        ap_req = max(1.0, min(50.0, float(new_ap)))
+        ap_req = max(1.0, min(LENS_SEMI_MAX_MM, float(new_ap)))
         ap = self._max_drawable_aperture(elem_index, ap_req)
         ap = max(1.0, min(ap_req, ap))
         ev = self.elem_vars[elem_index]
@@ -2820,7 +3159,7 @@ class OptiFluxApp(tk.Tk):
         if bool(ev.get("use_elliptical_ap") and ev["use_elliptical_ap"].get()):
             old_apy = max(float(ev["aperture_y"].get()), 1e-6)
             ratio = ap / old_ap
-            ev["aperture_y"].set(round(max(1.0, min(50.0, old_apy * ratio)), 3))
+            ev["aperture_y"].set(round(max(1.0, min(LENS_SEMI_MAX_MM, old_apy * ratio)), 3))
         else:
             ev["aperture_y"].set(round(ap, 3))
         self.status_var.set(f"Element {elem_index + 1} semi-aperture → {ap:.2f} mm")
@@ -2963,6 +3302,28 @@ class OptiFluxApp(tk.Tk):
         # Cancel an in-flight trace so the grab stays live (geometry preview
         # only). Re-trace runs on mouse release.
         self._cancel_trace_work()
+        use_xz = event.inaxes is getattr(self, "ax_side_xz", None)
+        fov_hit = self._pick_fov_side(
+            float(event.xdata), float(event.ydata), use_xz=bool(use_xz)
+        )
+        if fov_hit is not None and fov_hit[0] == "resize":
+            _mode, h, which = fov_hit
+            end_t = float(h["t_lo"] if which == "lo" else h["t_hi"])
+            self._drag = {
+                "mode": "fov_resize",
+                "elem_index": -1,
+                "use_xz": bool(use_xz),
+                "which": which,
+                "orig_center": float(h["t_c"]),
+                "orig_size": float(h["size"]),
+                "current_end": end_t,
+                "label": "FOV width" if use_xz else "FOV height",
+            }
+            self.canvas_side.get_tk_widget().configure(cursor="sb_v_double_arrow")
+            self.status_var.set(
+                f"Resizing {self._drag['label']}  ·  {float(h['size']):.1f} mm"
+            )
+            return
         # Prefer blockers near the click (small pick radius on Z)
         blk = self._pick_blocker(float(event.xdata), float(event.ydata))
         if blk is not None:
@@ -2984,6 +3345,20 @@ class OptiFluxApp(tk.Tk):
             return
         picked = self._pick_element_interaction(float(event.xdata), float(event.ydata))
         if picked is None:
+            if fov_hit is not None and fov_hit[0] == "move":
+                h = fov_hit[1]
+                self._drag = {
+                    "mode": "fov_move",
+                    "elem_index": -1,
+                    "use_xz": bool(use_xz),
+                    "orig_center": float(h["t_c"]),
+                    "current_center": float(h["t_c"]),
+                    "press_t": float(event.ydata),
+                    "label": "FOV center X" if use_xz else "FOV center Y",
+                }
+                self.canvas_side.get_tk_widget().configure(cursor="fleur")
+                self.status_var.set(f"Moving {self._drag['label']}")
+                return
             return
         hit, mode = picked
         idx = int(hit["index"])
@@ -3006,7 +3381,7 @@ class OptiFluxApp(tk.Tk):
 
         max_ap = None
         if mode == "resize":
-            max_ap = self._max_drawable_aperture(idx, 50.0)
+            max_ap = self._max_drawable_aperture(idx, LENS_SEMI_MAX_MM)
             # Never start past the drawable limit
             ap = min(ap, max_ap)
         self._drag = {
@@ -3084,6 +3459,14 @@ class OptiFluxApp(tk.Tk):
 
         if self._drag is None:
             if event.inaxes in self._side_axes() and event.xdata is not None and event.ydata is not None:
+                hover_xz = event.inaxes is getattr(self, "ax_side_xz", None)
+                fov_h = self._pick_fov_side(
+                    float(event.xdata), float(event.ydata), use_xz=bool(hover_xz)
+                )
+                if fov_h is not None and fov_h[0] == "resize":
+                    cur = "sb_v_double_arrow"
+                    self.canvas_side.get_tk_widget().configure(cursor=cur)
+                    return
                 if self._pick_blocker(float(event.xdata), float(event.ydata)) is not None:
                     cur = "sb_h_double_arrow"
                 else:
@@ -3103,6 +3486,33 @@ class OptiFluxApp(tk.Tk):
         if event.inaxes not in self._side_axes():
             return
         mode = self._drag.get("mode", "move")
+        if mode == "fov_resize":
+            if event.ydata is None:
+                return
+            self._drag["current_end"] = float(event.ydata)
+            _c, new_size = resize_fov_from_end(
+                float(self._drag["orig_center"]),
+                float(self._drag["orig_size"]),
+                float(event.ydata),
+            )
+            self._set_fov_span(new_size, use_xz=bool(self._drag.get("use_xz")))
+            self.status_var.set(
+                f"Resizing {self._drag['label']}  ·  {new_size:.1f} mm"
+            )
+            self._draw_side()
+            return
+        if mode == "fov_move":
+            if event.ydata is None:
+                return
+            dt = float(event.ydata) - float(self._drag["press_t"])
+            new_c = float(self._drag["orig_center"]) + dt
+            self._drag["current_center"] = new_c
+            self._set_fov_center_axis(new_c, use_xz=bool(self._drag.get("use_xz")))
+            self.status_var.set(
+                f"Moving {self._drag['label']}  ·  {new_c:.2f} mm"
+            )
+            self._draw_side()
+            return
         if mode == "blocker_move":
             if event.xdata is None:
                 return
@@ -3120,7 +3530,7 @@ class OptiFluxApp(tk.Tk):
                 return
             # Clamp to the max aperture the glass can still support so the
             # grey handles never leave the lens outline (element 3 symptom).
-            requested = max(1.0, min(50.0, abs(float(event.ydata))))
+            requested = max(1.0, min(LENS_SEMI_MAX_MM, abs(float(event.ydata))))
             max_ap = self._drag.get("max_aperture")
             if max_ap is None:
                 max_ap = self._max_drawable_aperture(
@@ -3190,6 +3600,24 @@ class OptiFluxApp(tk.Tk):
         self._drag = None
         self.canvas_side.get_tk_widget().configure(cursor="hand2")
         mode = drag.get("mode", "move")
+        if mode in ("fov_resize", "fov_move"):
+            if mode == "fov_resize":
+                _c, new_size = resize_fov_from_end(
+                    float(drag.get("orig_center", 0.0)),
+                    float(drag.get("orig_size", 40.0)),
+                    float(drag.get("current_end", 0.0)),
+                )
+                self._set_fov_span(new_size, use_xz=bool(drag.get("use_xz")))
+                msg = f"{drag.get('label', 'FOV')} = {new_size:.1f} mm — tracing…"
+            else:
+                self._set_fov_center_axis(
+                    float(drag.get("current_center", 0.0)),
+                    use_xz=bool(drag.get("use_xz")),
+                )
+                msg = f"{drag.get('label', 'FOV')} — tracing…"
+            self._refresh_fov_overlay()
+            self._request_trace_after_edit(msg)
+            return
         if mode == "blocker_move":
             bi = int(drag.get("blocker_index", -1))
             new_z = float(drag.get("current_z", drag.get("orig_z", 0)))
@@ -3210,10 +3638,12 @@ class OptiFluxApp(tk.Tk):
             if self._debounce_id is not None:
                 self.after_cancel(self._debounce_id)
                 self._debounce_id = None
-            self.status_var.set(
+            if self._debounce_id is not None:
+                self.after_cancel(self._debounce_id)
+                self._debounce_id = None
+            self._request_trace_after_edit(
                 f"{drag.get('label', 'Blocker')} Z = {new_z:.2f} mm — tracing…"
             )
-            self.run_trace()
             return
         if mode == "resize":
             new_ap = float(drag.get("current_aperture", drag["orig_aperture"]))
@@ -3225,10 +3655,9 @@ class OptiFluxApp(tk.Tk):
             if self._debounce_id is not None:
                 self.after_cancel(self._debounce_id)
                 self._debounce_id = None
-            self.status_var.set(
+            self._request_trace_after_edit(
                 f"{drag['label']} semi-aperture = {new_ap:.2f} mm — tracing…"
             )
-            self.run_trace()
             return
         if mode in ("radius_front", "radius_rear"):
             which = "front" if mode == "radius_front" else "rear"
@@ -3245,10 +3674,9 @@ class OptiFluxApp(tk.Tk):
                 self.after_cancel(self._debounce_id)
                 self._debounce_id = None
             rlabel = "R₁" if which == "front" else "R₂"
-            self.status_var.set(
+            self._request_trace_after_edit(
                 f"{drag['label']} {rlabel} = {new_R:.2f} mm — tracing…"
             )
-            self.run_trace()
             return
         new_front = drag["current_front"]
         if abs(new_front - drag["orig_front"]) < 1e-4:
@@ -3259,8 +3687,9 @@ class OptiFluxApp(tk.Tk):
         if self._debounce_id is not None:
             self.after_cancel(self._debounce_id)
             self._debounce_id = None
-        self.status_var.set(f"{drag['label']} at Z = {new_front:.2f} mm — tracing…")
-        self.run_trace()
+        self._request_trace_after_edit(
+            f"{drag['label']} at Z = {new_front:.2f} mm — tracing…"
+        )
 
     @staticmethod
     def _elem_index_from_label(label: str) -> Optional[int]:
@@ -3470,6 +3899,8 @@ class OptiFluxApp(tk.Tk):
         target_z = p["target_z"]
         layout = self._element_layout(p)
         self._element_handles = layout
+        self._blocker_handles = []
+        self._fov_side_handles = []
 
         drag_idx = None
         drag_dz = 0.0
@@ -3530,7 +3961,7 @@ class OptiFluxApp(tk.Tk):
         pairs = self._surface_pairs(live_surfs)
         mla_mode = any(s.label.startswith("MLA") for s in live_surfs)
 
-        # Shared Z extent; transverse extents per plane
+        # Shared Z extent; independent transverse extents per plane
         t_ext_y = 12.0
         t_ext_x = 12.0
         live_src = live_dies if live_dies else list(res.dies)
@@ -3551,6 +3982,12 @@ class OptiFluxApp(tk.Tk):
         if drag_ap is not None:
             t_ext_y = max(t_ext_y, drag_ap * 1.2)
             t_ext_x = max(t_ext_x, drag_ap * 1.2)
+        # Include the FOV bar so a tall/wide field does not look like a Y collapse
+        try:
+            t_ext_y = max(t_ext_y, abs(float(p["fov_cy"])) + float(p["fov_height"]) * 0.5 + 2.0)
+            t_ext_x = max(t_ext_x, abs(float(p["fov_cx"])) + float(p["fov_width"]) * 0.5 + 2.0)
+        except (TypeError, ValueError, KeyError):
+            pass
         z0 = min((d.cz for d in res.dies), default=0) - 5
         z_max_optics = max((s.z_vertex for s in res.surfaces), default=10)
         if self._drag is not None and drag_mode == "move":
@@ -3558,7 +3995,7 @@ class OptiFluxApp(tk.Tk):
                 z_max_optics, self._drag["current_front"] + self._drag["thickness"]
             )
         z1 = max(target_z, z_max_optics) + 10
-        self._side_full_extent = (z0, z1, -t_ext_y, t_ext_y)
+        self._side_full_extent = side_full_extent(z0, z1, t_ext_y, t_ext_x)
 
         ctx = dict(
             res=res,
@@ -3618,7 +4055,12 @@ class OptiFluxApp(tk.Tk):
         self._apply_side_limits(self.ax_side)
         if hasattr(self, "ax_side_xz"):
             self._apply_side_limits(self.ax_side_xz, plane="xz")
-        self.fig_side.tight_layout()
+        if not getattr(self, "_side_layout_done", False):
+            try:
+                self.fig_side.tight_layout()
+            except Exception:
+                pass
+            self._side_layout_done = True
         self.canvas_side.draw_idle()
 
     def _draw_blockers_side(self, ax, p, *, plane: str, use_xz: bool):
@@ -3724,8 +4166,9 @@ class OptiFluxApp(tk.Tk):
                 "t_lo": c0 - outer_t,
                 "t_hi": c0 + outer_t,
                 "label": lab,
+                "plane": plane,
             })
-        self._blocker_handles = handles
+        self._blocker_handles = list(getattr(self, "_blocker_handles", []) or []) + handles
 
     def _paint_side_plane(
         self,
@@ -3920,7 +4363,12 @@ class OptiFluxApp(tk.Tk):
                 zorder=7,
             )
 
-        if self._drag is None:
+        draw_rays = should_draw_display_rays(
+            auto_run=bool(self.auto_run.get()) if hasattr(self, "auto_run") else True,
+            dragging=self._drag is not None,
+            preview=bool(getattr(self, "_draw_side_preview", False)),
+        )
+        if draw_rays:
             color_cls = bool(getattr(self, "v_color_partial", None) and self.v_color_partial.get())
             stack_need, only_mla = self._stack_element_counts(res)
             max_ap = max((float(h["aperture"]) for h in layout), default=10.0)
@@ -3985,14 +4433,60 @@ class OptiFluxApp(tk.Tk):
 
         ax.axvline(target_z, color=TARGET, ls="--", lw=1.4, zorder=4)
         if use_xz:
-            f0 = p["fov_cx"] - p["fov_width"] / 2
-            f1 = p["fov_cx"] + p["fov_width"] / 2
+            f_c = float(p["fov_cx"])
+            f_span = float(p["fov_width"])
         else:
-            f0 = p["fov_cy"] - p["fov_height"] / 2
-            f1 = p["fov_cy"] + p["fov_height"] / 2
+            f_c = float(p["fov_cy"])
+            f_span = float(p["fov_height"])
+        if (
+            self._drag is not None
+            and self._drag.get("mode") in ("fov_resize", "fov_move")
+            and bool(self._drag.get("use_xz", False)) == bool(use_xz)
+        ):
+            if self._drag.get("mode") == "fov_resize":
+                f_c, f_span = resize_fov_from_end(
+                    float(self._drag.get("orig_center", f_c)),
+                    float(self._drag.get("orig_size", f_span)),
+                    float(self._drag.get("current_end", f_c + f_span / 2)),
+                )
+            else:
+                f_c = float(self._drag.get("current_center", f_c))
+        f0 = f_c - f_span / 2
+        f1 = f_c + f_span / 2
         ax.plot([target_z, target_z], [f0, f1], color=FOV, lw=3, zorder=5)
+        # Grab handles at the FOV bar ends (size) and mid-span (move)
+        for end_t, which in ((f0, "lo"), (f1, "hi")):
+            ax.plot(
+                target_z,
+                end_t,
+                "D",
+                color="#c4b5fd",
+                ms=7,
+                zorder=9,
+                markeredgecolor="#0b0f14",
+                markeredgewidth=0.6,
+            )
+        ax.plot(
+            target_z,
+            f_c,
+            marker="s",
+            markersize=6,
+            color="#a78bfa",
+            markeredgecolor="#ede9fe",
+            zorder=9,
+        )
         ax.text(target_z, t_ext * 0.92, " TARGET", color=TARGET, fontsize=8, va="top")
         ax.text(target_z, f1, " FOV", color=FOV, fontsize=8, va="bottom")
+        self._fov_side_handles = list(getattr(self, "_fov_side_handles", []) or []) + [
+            {
+                "plane": "xz" if use_xz else "yz",
+                "z": float(target_z),
+                "t_lo": float(f0),
+                "t_hi": float(f1),
+                "t_c": float(f_c),
+                "size": float(f_span),
+            }
+        ]
 
 
     def _connect_target_mouse(self):
@@ -4091,6 +4585,39 @@ class OptiFluxApp(tk.Tk):
         if event.button == 1 and getattr(event, "dblclick", False):
             self._reset_tgt_zoom()
             return
+        if event.button == 1 and event.xdata is not None and event.ydata is not None:
+            try:
+                w = float(self.v_fov_w.get())
+                h = float(self.v_fov_h.get())
+                cx = float(self.v_fov_cx.get())
+                cy = float(self.v_fov_cy.get())
+            except (tk.TclError, ValueError):
+                w = h = cx = cy = 0.0
+            span = max(w, h, 1.0)
+            hit = pick_fov_rect_handle(
+                float(event.xdata),
+                float(event.ydata),
+                cx,
+                cy,
+                w,
+                h,
+                hit_r=max(1.2, 0.04 * span),
+            )
+            if hit is not None:
+                self._cancel_trace_work()
+                self._drag = {
+                    "mode": "fov_tgt",
+                    "elem_index": -1,
+                    "kind": hit[0],
+                    "name": hit[1],
+                    "orig": (cx, cy, w, h),
+                    "press": (float(event.xdata), float(event.ydata)),
+                    "label": "FOV",
+                }
+                self.canvas_tgt.get_tk_widget().configure(
+                    cursor="fleur" if hit[0] == "move" else "plus"
+                )
+                return
         if event.button in (2, 3) and event.x is not None and event.y is not None:
             self._tgt_pan = {
                 "xpress": event.x,
@@ -4144,8 +4671,52 @@ class OptiFluxApp(tk.Tk):
             self._tgt_pan = None
             self._schedule_target_map_expand()
             self.canvas_tgt.get_tk_widget().configure(cursor="")
+            return
+        if self._drag is not None and self._drag.get("mode") == "fov_tgt":
+            self._drag = None
+            self.canvas_tgt.get_tk_widget().configure(cursor="")
+            try:
+                w = float(self.v_fov_w.get())
+                h = float(self.v_fov_h.get())
+            except (tk.TclError, ValueError):
+                w = h = 0.0
+            self._request_trace_after_edit(
+                f"FOV {w:.1f} × {h:.1f} mm — tracing…"
+            )
 
     def _on_tgt_motion(self, event):
+        if (
+            self._drag is not None
+            and self._drag.get("mode") == "fov_tgt"
+            and event.xdata is not None
+            and event.ydata is not None
+        ):
+            cx0, cy0, w0, h0 = self._drag["orig"]
+            px, py = self._drag["press"]
+            kind = self._drag.get("kind")
+            name = self._drag.get("name")
+            lock = bool(self.v_fov_lock.get()) if hasattr(self, "v_fov_lock") else False
+            if kind == "move":
+                cx, cy = move_fov_center(
+                    cx0, cy0, float(event.xdata) - px, float(event.ydata) - py
+                )
+                w, h = w0, h0
+            else:
+                cx, cy, w, h = resize_fov_rect(
+                    cx0,
+                    cy0,
+                    w0,
+                    h0,
+                    edge=name if kind == "edge" else None,
+                    corner=name if kind == "corner" else None,
+                    x=float(event.xdata),
+                    y=float(event.ydata),
+                    lock_aspect=lock and kind == "edge",
+                )
+            self._set_fov_rect(cx, cy, w, h)
+            self._refresh_fov_overlay()
+            self.status_var.set(f"FOV {w:.1f} × {h:.1f} mm @ ({cx:.1f}, {cy:.1f})")
+            return
         if self._tgt_pan is None or event.x is None or event.y is None:
             return
         if self.ax_tgt is None:
@@ -4223,6 +4794,31 @@ class OptiFluxApp(tk.Tk):
             if dz < best_d and dz < 2.5:
                 best_d = dz
                 best = (int(h["index"]), float(h["z"]))
+        return best
+
+    def _pick_fov_side(self, z: float, t: float, *, use_xz: bool):
+        """Return ('resize', handle, which) or ('move', handle, None) or None."""
+        want = "xz" if use_xz else "yz"
+        best = None
+        best_d = 1e9
+        for h in getattr(self, "_fov_side_handles", []) or []:
+            if h.get("plane") != want:
+                continue
+            hz = float(h["z"])
+            if abs(float(z) - hz) > 4.0:
+                continue
+            t_lo, t_hi, t_c = float(h["t_lo"]), float(h["t_hi"]), float(h["t_c"])
+            d_lo = math.hypot(float(z) - hz, float(t) - t_lo)
+            d_hi = math.hypot(float(z) - hz, float(t) - t_hi)
+            hit_r = max(2.2, 0.08 * max(abs(t_hi - t_lo), 8.0))
+            if d_lo < best_d and d_lo <= hit_r:
+                best_d = d_lo
+                best = ("resize", h, "lo")
+            if d_hi < best_d and d_hi <= hit_r:
+                best_d = d_hi
+                best = ("resize", h, "hi")
+            if best is None and t_lo <= float(t) <= t_hi and abs(float(z) - hz) < 2.8:
+                best = ("move", h, None)
         return best
 
     def _draw_profiles(self):
@@ -4344,6 +4940,8 @@ class OptiFluxApp(tk.Tk):
         self.canvas_prof.draw_idle()
 
     def _draw_target(self):
+        self._fov_rect_patch = None
+        self._fov_tgt_handle_arts = []
         self.fig_tgt.clf()
         ax = self.fig_tgt.add_subplot(111)
         self.ax_tgt = ax
@@ -4386,6 +4984,8 @@ class OptiFluxApp(tk.Tk):
             label="Camera FOV",
         )
         ax.add_patch(rect)
+        self._fov_rect_patch = rect
+        self._paint_fov_tgt_handles(ax, fov_cx, fov_cy, fov_w, fov_h)
         cx, cy = res.stats["centroid"]
         ax.plot(cx, cy, "+", color="white", ms=10, mew=1.5)
         ax.axhline(0, color="#64748b", ls=":", lw=0.7, alpha=0.5)
@@ -4478,7 +5078,7 @@ class OptiFluxApp(tk.Tk):
                 )
 
         ax.set_title(
-            "TARGET PLANE  ·  scroll zoom  ·  right-drag pan",
+            "TARGET PLANE  ·  FOV handles  ·  scroll zoom  ·  right-drag pan",
             loc="left",
             fontsize=10,
             color=FG_BRIGHT,
@@ -4721,6 +5321,7 @@ class OptiFluxApp(tk.Tk):
             self.v_fov_lock.set(p["fov_aspect_lock"])
         self.v_map_w.set(p["map_half_w"])
         self.v_map_h.set(p["map_half_h"])
+        self._grow_map_sliders_to_fov()
         self.v_map_res.set(p["map_res"])
         self.v_rays.set(p["total_rays"])
         self.v_disp.set(p["display_rays"])
@@ -4743,6 +5344,18 @@ class OptiFluxApp(tk.Tk):
             self.v_cad_flange_r.set(float(p["cad_flange_radial_mm"]))
         if hasattr(self, "v_cad_flange_t") and "cad_flange_thickness_mm" in p:
             self.v_cad_flange_t.set(float(p["cad_flange_thickness_mm"]))
+        if hasattr(self, "v_cad_halves"):
+            self.v_cad_halves.set(bool(p.get("cad_export_halves", False)))
+        if hasattr(self, "v_pol_dia"):
+            self.v_pol_dia.set(float(p.get("cad_polish_tool_dia_mm", 10.0)))
+            self.v_pol_step.set(float(p.get("cad_polish_stepover_mm", 0.3)))
+            self.v_pol_allow.set(float(p.get("cad_polish_allowance_mm", 0.0)))
+            self.v_pol_feed.set(float(p.get("cad_polish_feed_mm_min", 100.0)))
+            self.v_pol_retr.set(float(p.get("cad_polish_retract_mm", 5.0)))
+            self.v_pol_rpm.set(float(p.get("cad_polish_rpm", 5000.0)))
+            self.v_pol_revs.set(float(p.get("cad_polish_revs", 2.0)))
+            self.v_pol_surf.set(str(p.get("cad_polish_surface", "front")))
+            self.v_pol_strat.set(str(p.get("cad_polish_strategy", "helical")))
         if hasattr(self, "cad_mesh_status"):
             self._refresh_cad_mesh_label()
         # Absorbing panels
@@ -4767,6 +5380,111 @@ class OptiFluxApp(tk.Tk):
             return
         self._apply_shape_to_element(elem_index)
 
+    def _set_fov_span(self, size: float, *, use_xz: bool) -> None:
+        """Set FOV width (X–Z) or height (Y–Z), honouring aspect lock."""
+        size = clamp_fov_size(size)
+        lock = bool(self.v_fov_lock.get())
+        self._fov_syncing = True
+        try:
+            if use_xz:
+                old_w = max(float(self.v_fov_w.get()), 1e-9)
+                self.v_fov_w.set(round(size, 3))
+                if lock:
+                    self.v_fov_h.set(
+                        round(clamp_fov_size(float(self.v_fov_h.get()) * (size / old_w)), 3)
+                    )
+            else:
+                old_h = max(float(self.v_fov_h.get()), 1e-9)
+                self.v_fov_h.set(round(size, 3))
+                if lock:
+                    self.v_fov_w.set(
+                        round(clamp_fov_size(float(self.v_fov_w.get()) * (size / old_h)), 3)
+                    )
+            w = float(self.v_fov_w.get())
+            h = float(self.v_fov_h.get())
+            if h > 1e-9:
+                self.v_fov_aspect.set(round(w / h, 4))
+        finally:
+            self._fov_syncing = False
+
+    def _set_fov_center_axis(self, value: float, *, use_xz: bool) -> None:
+        value = max(-200.0, min(200.0, float(value)))
+        if use_xz:
+            self.v_fov_cx.set(round(value, 3))
+        else:
+            self.v_fov_cy.set(round(value, 3))
+
+    def _set_fov_rect(self, cx: float, cy: float, w: float, h: float) -> None:
+        self._fov_syncing = True
+        try:
+            self.v_fov_cx.set(round(float(cx), 3))
+            self.v_fov_cy.set(round(float(cy), 3))
+            self.v_fov_w.set(round(clamp_fov_size(w), 3))
+            self.v_fov_h.set(round(clamp_fov_size(h), 3))
+            hh = max(float(self.v_fov_h.get()), 1e-9)
+            self.v_fov_aspect.set(round(float(self.v_fov_w.get()) / hh, 4))
+        finally:
+            self._fov_syncing = False
+
+    def _refresh_fov_overlay(self):
+        """Move the target-plane FOV rectangle without rebuilding the heatmap."""
+        ax = getattr(self, "ax_tgt", None)
+        patch = getattr(self, "_fov_rect_patch", None)
+        if ax is None or patch is None:
+            return
+        try:
+            w = float(self.v_fov_w.get())
+            h = float(self.v_fov_h.get())
+            cx = float(self.v_fov_cx.get())
+            cy = float(self.v_fov_cy.get())
+        except (tk.TclError, ValueError):
+            return
+        patch.set_xy((cx - w / 2.0, cy - h / 2.0))
+        patch.set_width(w)
+        patch.set_height(h)
+        self._paint_fov_tgt_handles(ax, cx, cy, w, h)
+        try:
+            self.canvas_tgt.draw_idle()
+        except Exception:
+            pass
+
+    def _paint_fov_tgt_handles(self, ax, cx, cy, w, h):
+        """Corner / edge grips on the target-plane FOV rectangle."""
+        for art in getattr(self, "_fov_tgt_handle_arts", []) or []:
+            try:
+                art.remove()
+            except Exception:
+                pass
+        self._fov_tgt_handle_arts = []
+        x0, x1 = cx - w / 2.0, cx + w / 2.0
+        y0, y1 = cy - h / 2.0, cy + h / 2.0
+        pts = {
+            "nw": (x0, y1),
+            "ne": (x1, y1),
+            "sw": (x0, y0),
+            "se": (x1, y0),
+            "left": (x0, cy),
+            "right": (x1, cy),
+            "top": (cx, y1),
+            "bottom": (cx, y0),
+        }
+        xs, ys = zip(*pts.values()) if pts else ([], [])
+        (ln,) = ax.plot(
+            list(xs),
+            list(ys),
+            "D",
+            color="#c4b5fd",
+            ms=6,
+            zorder=10,
+            markeredgecolor="#0b0f14",
+            markeredgewidth=0.5,
+        )
+        self._fov_tgt_handle_arts = [ln]
+        self._fov_tgt_handles = [
+            {"kind": "corner" if k in ("nw", "ne", "sw", "se") else "edge", "name": k, "x": px, "y": py}
+            for k, (px, py) in pts.items()
+        ]
+
     def _on_fov_dim_change(self, *_):
         if getattr(self, "_fov_syncing", False):
             return
@@ -4782,6 +5500,97 @@ class OptiFluxApp(tk.Tk):
             self.v_fov_aspect.set(round(w / h, 4))
         finally:
             self._fov_syncing = False
+        self._grow_map_sliders_to_fov()
+
+    def _grow_map_sliders_to_fov(self) -> None:
+        """Keep the recorded map at least as large as the FOV rectangle."""
+        if not hasattr(self, "v_map_w"):
+            return
+        try:
+            w = float(self.v_fov_w.get())
+            h = float(self.v_fov_h.get())
+            cx = float(self.v_fov_cx.get())
+            cy = float(self.v_fov_cy.get())
+            hw = float(self.v_map_w.get())
+            hh = float(self.v_map_h.get())
+        except (tk.TclError, ValueError):
+            return
+        nw, nh = map_half_covering_fov(w, h, cx, cy, hw, hh)
+        if nw > hw + 0.05:
+            self.v_map_w.set(round(nw, 1))
+        if nh > hh + 0.05:
+            self.v_map_h.set(round(nh, 1))
+
+    def _focus_group_on_target(self):
+        """Slide the lens group along Z until the source images onto the FOV plane."""
+        if getattr(self, "_optimizing", False) or getattr(self, "_focusing", False):
+            messagebox.showinfo("Focus", "A search is already running.")
+            return
+        params = self.collect_params()
+        if not any(e.get("enabled") for e in params.get("elements") or []):
+            messagebox.showwarning("Focus", "Enable at least one lens element.")
+            return
+        self._focusing = True
+        self._opt_gen += 1
+        gen = self._opt_gen
+        was_auto = bool(self.auto_run.get())
+        self.auto_run.set(False)
+        self.status_var.set("Focusing group — imaging the source onto the target…")
+        self.progress["value"] = 0
+
+        def work():
+            err = None
+            result = None
+            try:
+                result = focus_group_on_target(
+                    params,
+                    n_scan=21,
+                    n_refine=11,
+                    rays_per_point=36,
+                    should_cancel=lambda: gen != self._opt_gen,
+                    progress_cb=lambda f, m: self.after(
+                        0,
+                        lambda: (
+                            self.progress.configure(value=f * 100),
+                            self.status_var.set(m),
+                        ),
+                    ),
+                )
+            except Exception as e:
+                err = e
+            self.after(0, lambda: self._on_focus_group_done(gen, result, err, was_auto))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_focus_group_done(self, gen: int, result, err, was_auto: bool):
+        self._focusing = False
+        self.progress["value"] = 100
+        self.auto_run.set(was_auto)
+        if gen != self._opt_gen:
+            self.status_var.set("Focus search cancelled.")
+            return
+        if err is not None:
+            self.status_var.set(f"Focus error: {err}")
+            messagebox.showerror("Focus failed", str(err))
+            return
+        result = result or {}
+        if not result.get("ok"):
+            msg = str(result.get("message") or "Focus search failed.")
+            self.status_var.set(msg)
+            messagebox.showwarning("Focus", msg)
+            return
+        z = float(result["lens_z_start"])
+        self.v_lens_z.set(round(z, 3))
+        msg = (
+            f"{result.get('message', 'Focused.')}  "
+            f"Group front Z = {z:.2f} mm."
+        )
+        self.status_var.set(msg)
+        if hasattr(self, "opt_status"):
+            self.opt_status.set(
+                f"Source image focus · Z={z:.2f} mm · blur {float(result.get('blur_mm', 0)):.2f} mm"
+            )
+        self._request_trace_after_edit(msg + " — tracing…")
 
     def _on_fov_aspect_change(self, *_):
         if getattr(self, "_fov_syncing", False) or not self.v_fov_lock.get():
@@ -4799,6 +5608,7 @@ class OptiFluxApp(tk.Tk):
             self.v_fov_w.set(round(w, 3))
         finally:
             self._fov_syncing = False
+        self._grow_map_sliders_to_fov()
         self._on_param_change()
 
     def _swap_anamorphic_xy(self):
@@ -5363,7 +6173,10 @@ class OptiFluxApp(tk.Tk):
             messagebox.showwarning("Export", "Enable at least one lens element.")
             return
         ext = ".stl" if fmt == "stl" else ".step"
+        halves = bool(getattr(self, "v_cad_halves", None) and self.v_cad_halves.get()) and fmt == "stl"
         title = "Export STL (mm)" if fmt == "stl" else "Export STEP (mm)"
+        if halves:
+            title = "Export STL print halves (mm)"
         path = filedialog.asksaveasfilename(
             title=title,
             defaultextension=ext,
@@ -5387,6 +6200,7 @@ class OptiFluxApp(tk.Tk):
                 include_plate=bool(self.v_export_plate.get()),
                 flange_radial_mm=fr,
                 flange_thickness_mm=ft,
+                split_halves=halves,
             )
             mla_on = bool(params.get("mla", {}).get("enabled"))
             n_en = sum(1 for e in params.get("elements", []) if e.get("enabled", True))
@@ -5401,6 +6215,11 @@ class OptiFluxApp(tk.Tk):
                 )
             else:
                 geom_note = "Single lens export"
+            if halves:
+                geom_note += (
+                    "\nPrint halves: each element is cut at the flange mid-plane "
+                    "(*_front.stl / *_rear.stl). Build on the flat cut and glue with the same resin."
+                )
             try:
                 specs, _ = build_lens_specs_from_params(params, dies)
                 n_r, n_t = tessellation_for_specs(
@@ -5421,6 +6240,51 @@ class OptiFluxApp(tk.Tk):
                 f"{geom_note}\n{tess_note}"
                 f"{note_line}\n"
                 f"Flange radial {fr:.2f} mm · thickness {ft:.2f} mm (CAD only).",
+            )
+            self.status_var.set(f"Exported {out.name}")
+        except Exception as e:
+            messagebox.showerror("Export failed", str(e))
+
+    def export_cnc_profile(self):
+        """Write 4-axis GRBL polish G-code. Default extension is .nc for Candle."""
+        params = self.collect_params()
+        if not any(e.get("enabled") for e in params["elements"]):
+            messagebox.showwarning("Export", "Enable at least one lens element.")
+            return
+        if bool((params.get("mla") or {}).get("enabled")):
+            messagebox.showwarning(
+                "Export",
+                "4-axis polish is for singlet halves. Turn MLA off.",
+            )
+            return
+        path = filedialog.asksaveasfilename(
+            title="Export 4-axis polish (mm, GRBL / Candle)",
+            defaultextension=CNC_PROFILE_EXT,
+            filetypes=[
+                ("CNC program", "*.nc"),
+                ("G-code", "*.gcode"),
+                ("All", "*.*"),
+            ],
+        )
+        if not path:
+            return
+        try:
+            out = export_lens_cnc_profile(params, path)
+            extra = ""
+            if str(params.get("cad_polish_surface", "front")).lower() == "both":
+                extra = (
+                    f"\nAlso wrote {out.with_name(out.stem.replace('_front', '') + '_rear.nc').name}"
+                    if "_front" in out.stem
+                    else "\nFront and rear halves are separate .nc files."
+                )
+            messagebox.showinfo(
+                "Export complete",
+                f"Wrote {out}{extra}\n\n"
+                "4-axis polish, millimetres.\n"
+                "A = optical axis (along X). Z = radial (spherical tool).\n"
+                "X0 = printed flat / flange mid-plane. Y = 0.\n"
+                "Zero X on the cut face, YZ on the A-axis centre.\n"
+                f"Extension is {CNC_PROFILE_EXT} for Candle.",
             )
             self.status_var.set(f"Exported {out.name}")
         except Exception as e:

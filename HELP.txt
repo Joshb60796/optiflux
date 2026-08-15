@@ -18,6 +18,10 @@ Auto-run
   slider or side-view handle (or after a button / dropdown click).
   Dragging still updates lens geometry live (shape, convexity, position);
   the Monte Carlo map does not start until the pointer is up.
+  When unchecked, OptiFlux does not trace, does not redraw thousands of
+  side-view ray paths, and does not refresh CAD mesh estimates — so you
+  can move lenses, blockers, sizes, and surfaces without the UI stalling.
+  Press Trace rays when you want a map again.
 
 Export STL / Export STEP
   Write CAD files of the current lens surfaces for 3D printing or machining.
@@ -27,6 +31,11 @@ Export STL / Export STEP
   the ray-trace. A companion *_tube.txt lists each element OD, flange
   thickness, groove-center Z, groove center-to-center, source-to-tube-front,
   and last-groove-to-focus (Target Z).
+  Check “STL as print halves” to cut each lens at the flange mid-plane and
+  write *_front.stl / *_rear.stl — a flat build face for resin printing;
+  glue the halves with the same photopolymer.
+  Export 4-axis polish writes GRBL for a spherical tool on A (optical
+  axis). Default extension is .nc for Candle.
 
 Reset defaults
   Restore factory starting parameters and re-trace.
@@ -187,7 +196,9 @@ Lens type
   Scales library-type radii while preserving the shape family.
 
 Material
-  Glass or plastic from the catalog (PMMA, N-BK7, Formlabs Clear, …).
+  Glass or plastic from the catalog. New elements default to Formlabs
+  Clear Resin (the SLA prototype material). PMMA, N-BK7, and others
+  remain in the dropdown.
   Index n is taken at the source wavelength.
 
 Surface mode
@@ -229,7 +240,24 @@ Target Z
 
 FOV width / FOV height
   Rectangular region of interest on the target plane (mm). This is the
-  “camera field” or illumination zone you want to fill.
+  “camera field” or illumination zone you want to fill. Range is 5–500 mm
+  (a 200×200 mm field at 150 mm throw is valid). The recorded map grows
+  automatically so the FOV is never clipped.
+  Drag the violet FOV bar ends on the side views, or the diamond grips on
+  the target-plane rectangle, to change the size the same way you resize
+  a lens or blocker. Drag the bar centre / rectangle interior to move it.
+
+Focus group on target
+  Moves the entire lens group along Z (internal gaps stay fixed) to the
+  position where each point on the source images most sharply onto the
+  FOV plane — the flashlight conjugate, where the emitter shape becomes
+  visible. This is not the same as the optimizer’s “sharpest illumination
+  border” (flood edge). A true image of the source needs throw ≳ 4× EFL;
+  otherwise the button still picks the least-blurred station on the bench.
+
+Lens Z start
+  First-vertex Z of the group. Range is 0.2–1000 mm so a group can sit
+  anywhere between a source at 0 and a target at 150 mm (or further).
 
 FOV aspect W/H
   Width divided by height. Lock aspect updates height when width changes.
@@ -403,7 +431,9 @@ Side views (Y–Z and X–Z)
     • Purple dots on front/rear vertices — drag to set R₁ / R₂
     • Top/bottom diamonds — clear semi-aperture
   Grey slabs = absorbing blockers (red square = Z drag).
-  Release the mouse to re-trace.
+  Violet bar at Target Z = FOV (diamonds resize, square moves).
+  Side-view zoom is a camera: it is not reset when a progressive batch
+  finishes. Release the mouse to re-trace (only if Auto-run is on).
 
 3D isometric view
   Header “3D view” — night optical bench: glowing LED chip, glass lens
@@ -414,10 +444,10 @@ Side views (Y–Z and X–Z)
   view (from +X / −Z).
 
 Target plane (X–Y)
-  Irradiance map at Target Z. Purple rectangle = FOV. White cross = power
-  centroid. Scroll / right-drag as in the side view. Zoom does not grow
-  the recorded map; display-path hits stay drawn so rays remain visible
-  when you zoom in.
+  Irradiance map at Target Z. Purple rectangle = FOV with grab handles on
+  corners and edges. White cross = power centroid. Scroll / right-drag as
+  in the side view. Zoom does not grow the recorded map; display-path hits
+  stay drawn so rays remain visible when you zoom in.
 
 Profiles panel (left of target plane)
   Always-visible line cuts along X (Y=0), Y (X=0), and the XY diagonal, with
@@ -440,6 +470,27 @@ Max vertex length (mm)
 Max facet angle (°)
   Largest allowed angle between neighbouring facets on a curved surface.
   1–2° is typical for a smooth print; 5–10° is a preview mesh.
+
+STL as print halves
+  Cuts each singlet at the flange mid-plane (z_front + thickness/2) and
+  writes *_front.stl and *_rear.stl. Each half has a flat disk on the cut
+  so a resin printer can build from that face; glue the halves with the
+  same photopolymer.
+
+Export 4-axis polish (.nc)
+  GRBL program for a mill like the Genmitsu Prover 3030 Ultra with the 4th
+  axis on A. Mount a printed lens half so its optical axis is the A-axis
+  (along machine X). A spherical abrasive in the vertical spindle approaches
+  radially in Z. Tool-center path is the optical meridian offset by the ball
+  radius along the air normal.
+    • X0 = flange mid-plane (the printed flat). X+ toward the optical surface.
+    • Y = 0 (stay in the vertical plane through A).
+    • Z = radial distance of the ball centre from A.
+    • A = rotation of the half (degrees, always increasing).
+  Helical: one pass rim → vertex while A winds. Rings: at each meridian
+  station, A spins in place then steps inward. Allowance is extra offset
+  along the normal (positive = lighter cut). Default extension is .nc for
+  Candle. Face = both writes *_front.nc and *_rear.nc.
 
 The panel shows the resulting ring × segment count, rim spacing, and
 triangle estimate. Both STL and STEP use this tessellation (STEP is

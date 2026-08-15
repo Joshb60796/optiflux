@@ -1042,6 +1042,659 @@ def write_tube_notes(path: Path | str, layout: Dict[str, Any]) -> Path:
     return path
 
 
+CNC_PROFILE_EXT = ".nc"
+
+
+def flange_cut_z(spec: LensSpec) -> float:
+    """Axial mid-plane of the print flange (build / glue face)."""
+    return float(spec.z_front) + 0.5 * float(spec.thickness)
+
+
+def half_stl_paths(path: Path | str, n_elements: int) -> List[Path]:
+    """Companion filenames for front/rear print halves."""
+    path = Path(path)
+    if path.suffix.lower() != ".stl":
+        path = path.with_suffix(".stl")
+    n = max(1, int(n_elements))
+    out: List[Path] = []
+    if n == 1:
+        out.append(path.with_name(f"{path.stem}_front.stl"))
+        out.append(path.with_name(f"{path.stem}_rear.stl"))
+        return out
+    for i in range(n):
+        out.append(path.with_name(f"{path.stem}_E{i + 1}_front.stl"))
+        out.append(path.with_name(f"{path.stem}_E{i + 1}_rear.stl"))
+    return out
+
+
+def _interp_xyz(a: np.ndarray, b: np.ndarray, z_cut: float) -> np.ndarray:
+    dz = float(b[2] - a[2])
+    if abs(dz) < 1e-15:
+        p = a.copy()
+        p[2] = z_cut
+        return p
+    t = (float(z_cut) - float(a[2])) / dz
+    t = min(1.0, max(0.0, t))
+    return a + t * (b - a)
+
+
+def _clip_mesh_keep(mesh: Mesh, z_cut: float, *, keep_front: bool) -> tuple:
+    """
+    Clip a closed mesh at z = z_cut.
+
+    keep_front=True keeps z <= z_cut. Returns (verts, faces, cap_edge_pairs).
+    """
+    verts = np.asarray(mesh.vertices, dtype=np.float64)
+    faces = np.asarray(mesh.faces, dtype=np.int32)
+    if verts.size == 0 or faces.size == 0:
+        return (
+            np.zeros((0, 3), dtype=np.float64),
+            np.zeros((0, 3), dtype=np.int32),
+            [],
+        )
+    eps = 1e-9
+    on_keep = np.zeros(len(verts), dtype=bool)
+    if keep_front:
+        on_keep = verts[:, 2] <= float(z_cut) + eps
+    else:
+        on_keep = verts[:, 2] >= float(z_cut) - eps
+
+    new_verts: List[np.ndarray] = []
+    remap = {}
+
+    def add_orig(i: int) -> int:
+        i = int(i)
+        if i in remap:
+            return remap[i]
+        remap[i] = len(new_verts)
+        new_verts.append(verts[i].copy())
+        return remap[i]
+
+    split_cache: Dict[Tuple[int, int], int] = {}
+
+    def add_split(i: int, j: int) -> int:
+        key = (i, j) if i < j else (j, i)
+        if key in split_cache:
+            return split_cache[key]
+        p = _interp_xyz(verts[i], verts[j], z_cut)
+        idx = len(new_verts)
+        new_verts.append(p)
+        split_cache[key] = idx
+        return idx
+
+    new_faces: List[Tuple[int, int, int]] = []
+    cap_edges: List[Tuple[int, int]] = []
+
+    for tri in faces:
+        ia, ib, ic = int(tri[0]), int(tri[1]), int(tri[2])
+        keep = [bool(on_keep[ia]), bool(on_keep[ib]), bool(on_keep[ic])]
+        ids = [ia, ib, ic]
+        n_keep = sum(keep)
+        if n_keep == 3:
+            new_faces.append((add_orig(ia), add_orig(ib), add_orig(ic)))
+            continue
+        if n_keep == 0:
+            continue
+        if n_keep == 2:
+            # Quad → two tris; the cut edge is between the two split points
+            # Walk edges to preserve winding.
+            pts: List[int] = []
+            cut: List[int] = []
+            for k in range(3):
+                i0, i1 = ids[k], ids[(k + 1) % 3]
+                k0, k1 = keep[k], keep[(k + 1) % 3]
+                if k0:
+                    pts.append(add_orig(i0))
+                if k0 != k1:
+                    s = add_split(i0, i1)
+                    pts.append(s)
+                    cut.append(s)
+            if len(pts) == 4:
+                new_faces.append((pts[0], pts[1], pts[2]))
+                new_faces.append((pts[0], pts[2], pts[3]))
+            elif len(pts) == 3:
+                new_faces.append((pts[0], pts[1], pts[2]))
+            if len(cut) == 2:
+                cap_edges.append((cut[0], cut[1]))
+            continue
+        # n_keep == 1: one triangle, cut edge between the two split points
+        pts = []
+        cut = []
+        for k in range(3):
+            i0, i1 = ids[k], ids[(k + 1) % 3]
+            k0, k1 = keep[k], keep[(k + 1) % 3]
+            if k0:
+                pts.append(add_orig(i0))
+            if k0 != k1:
+                s = add_split(i0, i1)
+                pts.append(s)
+                cut.append(s)
+        if len(pts) >= 3:
+            new_faces.append((pts[0], pts[1], pts[2]))
+        if len(cut) == 2:
+            cap_edges.append((cut[0], cut[1]))
+
+    if not new_verts:
+        return (
+            np.zeros((0, 3), dtype=np.float64),
+            np.zeros((0, 3), dtype=np.int32),
+            [],
+        )
+    return np.vstack(new_verts), np.array(new_faces, dtype=np.int32), cap_edges
+
+
+def _cap_loops_from_edges(
+    verts: np.ndarray,
+    edges: Sequence[Tuple[int, int]],
+    *,
+    flip: bool,
+) -> np.ndarray:
+    """Fan-triangulate closed intersection loops in the cut plane."""
+    if not edges or len(verts) == 0:
+        return np.zeros((0, 3), dtype=np.int32)
+    # Build undirected adjacency
+    adj: Dict[int, List[int]] = {}
+    for a, b in edges:
+        if a == b:
+            continue
+        adj.setdefault(int(a), []).append(int(b))
+        adj.setdefault(int(b), []).append(int(a))
+    unused = set()
+    for a, b in edges:
+        unused.add((min(int(a), int(b)), max(int(a), int(b))))
+    faces: List[Tuple[int, int, int]] = []
+    visited_nodes = set()
+    for start in list(adj.keys()):
+        if start in visited_nodes:
+            continue
+        loop = [start]
+        prev = None
+        cur = start
+        guard = 0
+        while guard < len(adj) + 3:
+            guard += 1
+            nxts = [n for n in adj.get(cur, []) if n != prev]
+            if not nxts:
+                break
+            # Prefer unused edge
+            nxt = None
+            for cand in nxts:
+                e = (min(cur, cand), max(cur, cand))
+                if e in unused:
+                    nxt = cand
+                    unused.discard(e)
+                    break
+            if nxt is None:
+                nxt = nxts[0]
+            if nxt == start:
+                break
+            if nxt in loop:
+                break
+            loop.append(nxt)
+            prev, cur = cur, nxt
+        if len(loop) < 3:
+            continue
+        for i in loop:
+            visited_nodes.add(i)
+        # Order by polar angle so the fan is a disk
+        pts = verts[np.array(loop, dtype=np.int32)]
+        cx = float(np.mean(pts[:, 0]))
+        cy = float(np.mean(pts[:, 1]))
+        ang = np.arctan2(pts[:, 1] - cy, pts[:, 0] - cx)
+        order = [loop[i] for i in np.argsort(ang)]
+        # Fan from the first vertex (on the circle, not a new center — avoids
+        # adding a vertex). For a near-circle this is a valid triangulation.
+        a0 = order[0]
+        for i in range(1, len(order) - 1):
+            b, c = order[i], order[i + 1]
+            if flip:
+                faces.append((a0, c, b))
+            else:
+                faces.append((a0, b, c))
+    if not faces:
+        return np.zeros((0, 3), dtype=np.int32)
+    return np.array(faces, dtype=np.int32)
+
+
+def split_mesh_at_z(mesh: Mesh, z_cut: float) -> Tuple[Mesh, Mesh]:
+    """
+    Split a closed solid at z = z_cut and cap each half with a planar face.
+
+    The cap is the resin-printer build / glue face (middle of the flange
+    when z_cut is the flange mid-plane).
+    """
+    zc = float(z_cut)
+    fv, ff, fe = _clip_mesh_keep(mesh, zc, keep_front=True)
+    rv, rf, re = _clip_mesh_keep(mesh, zc, keep_front=False)
+    # Front half cap faces +Z (toward the mate); rear half faces −Z.
+    if len(fv) and len(fe):
+        cap_f = _cap_loops_from_edges(fv, fe, flip=False)
+        if cap_f.size:
+            ff = np.vstack([ff, cap_f]) if len(ff) else cap_f
+    if len(rv) and len(re):
+        cap_r = _cap_loops_from_edges(rv, re, flip=True)
+        if cap_r.size:
+            rf = np.vstack([rf, cap_r]) if len(rf) else cap_r
+    if fv.size == 0:
+        fv = np.zeros((0, 3), dtype=np.float64)
+        ff = np.zeros((0, 3), dtype=np.int32)
+    if rv.size == 0:
+        rv = np.zeros((0, 3), dtype=np.float64)
+        rf = np.zeros((0, 3), dtype=np.int32)
+    return Mesh(fv, ff), Mesh(rv, rf)
+
+
+def _meridian_outline(
+    spec: LensSpec,
+    *,
+    flange_radial_mm: float = 0.0,
+    flange_thickness_mm: float = 0.0,
+    n: int = 48,
+) -> np.ndarray:
+    """Closed Y–Z outline of one singlet (mm), winding +Y then −Y."""
+    ap = max(1e-3, float(spec.aperture))
+    ap_y = float(spec.aperture_y) if spec.aperture_y else ap
+    mode = spec.mode or "rotational"
+    R1y = spec.R1y if spec.R1y is not None else spec.R1
+    R2y = spec.R2y if spec.R2y is not None else spec.R2
+    z1 = float(spec.z_front)
+    z2 = z1 + float(spec.thickness)
+    fr = max(0.0, float(flange_radial_mm or 0.0))
+    ft = max(0.0, float(flange_thickness_mm or 0.0))
+    inner_r = _clear_semi_mm(ap, ap_y)
+    outer_r = inner_r + fr if fr > 1e-6 and ft > 1e-6 else inner_r
+    z_c = flange_cut_z(spec)
+    z_ff = z_c - 0.5 * ft if ft > 1e-6 and fr > 1e-6 else None
+    z_rf = z_c + 0.5 * ft if ft > 1e-6 and fr > 1e-6 else None
+
+    ys = np.linspace(0.0, inner_r, max(8, int(n)))
+    front = []
+    rear = []
+    for y in ys:
+        s1 = sag_xy(0.0, float(y), spec.R1, R1y, spec.k1, 0.0, spec.A4_1, 0.0, mode)
+        s2 = sag_xy(0.0, float(y), spec.R2, R2y, spec.k2, 0.0, spec.A4_2, 0.0, mode)
+        front.append((z1 + (0.0 if s1 is None else s1), float(y)))
+        rear.append((z2 + (0.0 if s2 is None else s2), float(y)))
+    # +Y walk: front vertex → front rim → flange → rear rim → rear vertex
+    pts: List[Tuple[float, float]] = list(front)
+    if z_ff is not None and z_rf is not None:
+        pts.append((float(z_ff), inner_r))
+        pts.append((float(z_ff), outer_r))
+        pts.append((float(z_rf), outer_r))
+        pts.append((float(z_rf), inner_r))
+    pts.extend(reversed(rear))
+    # Mirror to −Y (skip the on-axis rear vertex duplicate)
+    minus = [(z, -y) for (z, y) in reversed(pts[1:-1])]
+    pts.extend(minus)
+    if pts:
+        pts.append(pts[0])
+    return np.array(pts, dtype=np.float64)
+
+
+def optical_meridian(
+    spec: LensSpec,
+    which: str,
+    n: int = 48,
+) -> np.ndarray:
+    """
+    Meridian of one optical face in design coordinates.
+
+    Returns (N, 2) array of (r, z) from the vertex (r=0) to the clear
+    aperture, millimetres. ``which`` is 'front' or 'rear'.
+    """
+    which = str(which or "front").lower()
+    ap = max(1e-3, float(spec.aperture))
+    ap_y = float(spec.aperture_y) if spec.aperture_y else ap
+    semi = _clear_semi_mm(ap, ap_y)
+    mode = spec.mode or "rotational"
+    n = max(8, int(n))
+    rs = np.linspace(0.0, semi, n)
+    z_v = float(spec.z_front) if which == "front" else float(spec.z_front) + float(spec.thickness)
+    if which == "front":
+        Rx, Ry = float(spec.R1), (spec.R1y if spec.R1y is not None else spec.R1)
+        kx, a4x = float(spec.k1), float(spec.A4_1)
+    else:
+        Rx, Ry = float(spec.R2), (spec.R2y if spec.R2y is not None else spec.R2)
+        kx, a4x = float(spec.k2), float(spec.A4_2)
+    pts = np.zeros((n, 2), dtype=np.float64)
+    for i, r in enumerate(rs):
+        s = sag_xy(float(r), 0.0, Rx, Ry, kx, 0.0, a4x, 0.0, mode)
+        pts[i, 0] = float(r)
+        pts[i, 1] = z_v + (0.0 if s is None else float(s))
+    return pts
+
+
+def meridian_air_normals(r: np.ndarray, z: np.ndarray, which: str) -> np.ndarray:
+    """
+    Unit normals in the (r, z) plane pointing into air.
+
+    Front face: air is -Z (toward the source). Rear face: air is +Z.
+    """
+    r = np.asarray(r, dtype=np.float64).reshape(-1)
+    z = np.asarray(z, dtype=np.float64).reshape(-1)
+    n = len(r)
+    nrm = np.zeros((n, 2), dtype=np.float64)
+    if n == 0:
+        return nrm
+    # Central differences along the meridian
+    dr = np.gradient(r)
+    dz = np.gradient(z)
+    # Tangent (dr, dz); rotate to a normal and pick the air side
+    # N = (dz, -dr) has N·(+Z) = -dr; we flip as needed.
+    nr = dz.copy()
+    nz = -dr.copy()
+    front = str(which or "front").lower() == "front"
+    for i in range(n):
+        # Want Nz < 0 on the front (air -Z), Nz > 0 on the rear
+        if front and nz[i] > 0:
+            nr[i] = -nr[i]
+            nz[i] = -nz[i]
+        if (not front) and nz[i] < 0:
+            nr[i] = -nr[i]
+            nz[i] = -nz[i]
+        ln = math.hypot(float(nr[i]), float(nz[i]))
+        if ln < 1e-15:
+            nr[i], nz[i] = 0.0, (-1.0 if front else 1.0)
+        else:
+            nr[i] /= ln
+            nz[i] /= ln
+    # Axis of revolution: the vertex normal is purely axial
+    if n > 0 and abs(float(r[0])) < 1e-9:
+        nr[0], nz[0] = 0.0, (-1.0 if front else 1.0)
+    nrm[:, 0] = nr
+    nrm[:, 1] = nz
+    return nrm
+
+
+def ball_tool_centers(
+    r: np.ndarray,
+    z: np.ndarray,
+    nr: np.ndarray,
+    nz: np.ndarray,
+    tool_radius_mm: float,
+    allowance_mm: float = 0.0,
+) -> np.ndarray:
+    """Ball-center meridian: surface + (R_tool + allowance) * air normal."""
+    off = float(tool_radius_mm) + float(allowance_mm)
+    r = np.asarray(r, dtype=np.float64).reshape(-1)
+    z = np.asarray(z, dtype=np.float64).reshape(-1)
+    nr = np.asarray(nr, dtype=np.float64).reshape(-1)
+    nz = np.asarray(nz, dtype=np.float64).reshape(-1)
+    tc = np.zeros((len(r), 2), dtype=np.float64)
+    tc[:, 0] = r + off * nr
+    tc[:, 1] = z + off * nz
+    return tc
+
+
+def polish_machine_coords(
+    spec: LensSpec,
+    which: str,
+    r_t: np.ndarray,
+    z_t: np.ndarray,
+    *,
+    x_origin: str = "cut",
+) -> np.ndarray:
+    """
+    Map tool-center (r, z_design) to machine (X, Y, Z) millimetres.
+
+    Genmitsu-style 4-axis: A along X (optical axis). Vertical spindle, so
+    Z is the radial approach. Y is held at 0.
+
+    X0 at the flange mid-plane (printed flat) by default; X+ toward the
+    optical surface so the half sticks out of the fixture.
+    """
+    r_t = np.asarray(r_t, dtype=np.float64).reshape(-1)
+    z_t = np.asarray(z_t, dtype=np.float64).reshape(-1)
+    z_cut = flange_cut_z(spec)
+    which = str(which or "front").lower()
+    xyz = np.zeros((len(r_t), 3), dtype=np.float64)
+    if str(x_origin or "cut").lower() == "vertex":
+        z_v = float(spec.z_front) if which == "front" else float(spec.z_front) + float(spec.thickness)
+        if which == "front":
+            xyz[:, 0] = z_v - z_t
+        else:
+            xyz[:, 0] = z_t - z_v
+    else:
+        if which == "front":
+            xyz[:, 0] = z_cut - z_t
+        else:
+            xyz[:, 0] = z_t - z_cut
+    xyz[:, 1] = 0.0
+    xyz[:, 2] = np.maximum(r_t, 0.0)
+    return xyz
+
+
+def polish_toolpath(
+    spec: LensSpec,
+    which: str,
+    *,
+    tool_radius_mm: float = 5.0,
+    allowance_mm: float = 0.0,
+    stepover_mm: float = 0.3,
+    strategy: str = "helical",
+    revs_per_ring: float = 2.0,
+    n_min: int = 16,
+    x_origin: str = "cut",
+) -> Dict[str, Any]:
+    """
+    Build a 4-axis polish path for one optical face.
+
+    Returns dict with machine xyz (N,3), a_deg (N,), n_spins, and metadata.
+    Points run rim -> vertex so the tool starts at the OD (clear of the chuck).
+    """
+    step = max(float(stepover_mm), 0.05)
+    semi = _clear_semi_mm(float(spec.aperture), spec.aperture_y)
+    n = max(int(n_min), int(math.ceil(semi / step)) + 1)
+    mer = optical_meridian(spec, which, n=n)
+    nrm = meridian_air_normals(mer[:, 0], mer[:, 1], which)
+    tc = ball_tool_centers(
+        mer[:, 0], mer[:, 1], nrm[:, 0], nrm[:, 1], tool_radius_mm, allowance_mm
+    )
+    # Rim first
+    mer = mer[::-1]
+    tc = tc[::-1]
+    xyz = polish_machine_coords(spec, which, tc[:, 0], tc[:, 1], x_origin=x_origin)
+    n_pts = len(xyz)
+    a = np.zeros(n_pts, dtype=np.float64)
+    n_spins = 0
+    strat = str(strategy or "helical").lower()
+    if strat == "rings":
+        revs = max(0.25, float(revs_per_ring))
+        # At each station the spindle dwells in XZ and A turns.
+        # Encode as duplicate XZ with A advanced (export expands to G1 A).
+        xs, ys, zs, aa = [], [], [], []
+        a_now = 0.0
+        for i in range(n_pts):
+            xs.append(xyz[i, 0])
+            ys.append(xyz[i, 1])
+            zs.append(xyz[i, 2])
+            aa.append(a_now)
+            a_now += 360.0 * revs
+            xs.append(xyz[i, 0])
+            ys.append(xyz[i, 1])
+            zs.append(xyz[i, 2])
+            aa.append(a_now)
+            n_spins += 1
+        xyz = np.column_stack([xs, ys, zs])
+        a = np.array(aa, dtype=np.float64)
+    else:
+        # Helical: A advances so the pitch along the tool-center path ~ stepover
+        a_now = 0.0
+        a[0] = 0.0
+        for i in range(1, n_pts):
+            ds = math.hypot(
+                float(xyz[i, 0] - xyz[i - 1, 0]),
+                float(xyz[i, 2] - xyz[i - 1, 2]),
+            )
+            a_now += (ds / step) * 360.0
+            a[i] = a_now
+        n_spins = int(round(a_now / 360.0))
+    return {
+        "xyz": xyz,
+        "a_deg": a,
+        "n_spins": n_spins,
+        "which": which,
+        "tool_radius_mm": float(tool_radius_mm),
+        "stepover_mm": step,
+        "strategy": strat,
+    }
+
+
+def _format_polish_gcode(
+    paths: Sequence[Dict[str, Any]],
+    *,
+    feed_mm_min: float = 100.0,
+    retract_mm: float = 5.0,
+    spindle_rpm: float = 5000.0,
+    y_offset_mm: float = 0.0,
+) -> str:
+    feed = max(1.0, float(feed_mm_min))
+    retr = max(0.5, float(retract_mm))
+    rpm = float(spindle_rpm)
+    y0 = float(y_offset_mm)
+    lines = [
+        "(OptiFlux 4-axis lens polish)",
+        "(Genmitsu-style: A = optical axis along X, Z = radial, Y = 0)",
+        "(Spherical abrasive: tool center is offset along the air normal)",
+        "(X0 = flange mid-plane / printed flat; X+ toward the optical surface)",
+        "(Mount the printed half with its axis on A. Candle: use .nc)",
+        "G21",
+        "G90",
+        "G94",
+        "G17",
+        f"G0 Z{retr:.4f}",
+    ]
+    if rpm > 1.0:
+        lines.append(f"M3 S{rpm:.0f}")
+    else:
+        lines.append("M3")
+    for pi, path in enumerate(paths):
+        xyz = np.asarray(path["xyz"], dtype=np.float64)
+        a = np.asarray(path["a_deg"], dtype=np.float64)
+        if len(xyz) == 0:
+            continue
+        which = path.get("which", "front")
+        lines.append(
+            f"(Face {which}  tool R={float(path.get('tool_radius_mm', 0)):.3f} mm  "
+            f"{path.get('strategy', 'helical')}  radial approach)"
+        )
+        x, y, z = float(xyz[0, 0]), float(xyz[0, 1]) + y0, float(xyz[0, 2])
+        z_safe = z + retr
+        lines.append(f"G0 X{x:.4f} Y{y:.4f} A{float(a[0]):.3f}")
+        lines.append(f"G0 Z{z_safe:.4f}")
+        lines.append(f"G1 Z{z:.4f} F{feed:.2f}")
+        for i in range(1, len(xyz)):
+            x, y, z = float(xyz[i, 0]), float(xyz[i, 1]) + y0, float(xyz[i, 2])
+            lines.append(f"G1 X{x:.4f} Y{y:.4f} Z{z:.4f} A{float(a[i]):.3f}")
+        lines.append(f"G0 Z{z + retr:.4f}")
+        if pi + 1 < len(paths):
+            lines.append("(Reclamp the mating half before the next face)")
+            lines.append("M0")
+    lines.append(f"G0 Z{retr:.4f}")
+    lines.append("M5")
+    lines.append("M30")
+    return "\n".join(lines) + "\n"
+
+
+def _force_nc_path(path: Path) -> Path:
+    path = Path(path)
+    if path.suffix.lower() not in (".nc", ".gcode", ".cnc", ".tap"):
+        return path.with_suffix(CNC_PROFILE_EXT)
+    if path.suffix.lower() == ".gcode":
+        return path.with_suffix(CNC_PROFILE_EXT)
+    return path
+
+
+def export_lens_cnc_profile(
+    params: Dict[str, Any],
+    path: str | Path,
+    *,
+    flange_radial_mm: float = 0.0,
+    flange_thickness_mm: float = 0.0,
+    feed_mm_min: Optional[float] = None,
+    safe_z_mm: Optional[float] = None,
+    tool_dia_mm: Optional[float] = None,
+    stepover_mm: Optional[float] = None,
+    surface: Optional[str] = None,
+    strategy: Optional[str] = None,
+    revs_per_ring: Optional[float] = None,
+    allowance_mm: Optional[float] = None,
+    spindle_rpm: Optional[float] = None,
+) -> Path:
+    """
+    Write 4-axis GRBL polish G-code for printed lens halves.
+
+    Machine: A rotary = optical axis (along X), spherical tool on the
+    vertical spindle approaching radially in Z. Default suffix .nc so
+    Candle / GRBL senders open the file.
+    """
+    path = _force_nc_path(Path(path))
+    specs, mode = build_lens_specs_from_params(params)
+    if not specs:
+        raise ValueError("No enabled lens element to export")
+    if mode == "mla":
+        raise ValueError("4-axis polish is for singlet halves, not an MLA plate")
+
+    p = params or {}
+    tool_dia = float(tool_dia_mm if tool_dia_mm is not None else p.get("cad_polish_tool_dia_mm", 10.0))
+    tool_r = max(0.25, tool_dia * 0.5)
+    step = float(stepover_mm if stepover_mm is not None else p.get("cad_polish_stepover_mm", 0.3))
+    surf = str(surface if surface is not None else p.get("cad_polish_surface", "front")).lower()
+    strat = str(strategy if strategy is not None else p.get("cad_polish_strategy", "helical")).lower()
+    revs = float(revs_per_ring if revs_per_ring is not None else p.get("cad_polish_revs", 2.0))
+    allow = float(allowance_mm if allowance_mm is not None else p.get("cad_polish_allowance_mm", 0.0))
+    feed = float(feed_mm_min if feed_mm_min is not None else p.get("cad_polish_feed_mm_min", 100.0))
+    retr = float(safe_z_mm if safe_z_mm is not None else p.get("cad_polish_retract_mm", 5.0))
+    rpm = float(spindle_rpm if spindle_rpm is not None else p.get("cad_polish_rpm", 5000.0))
+    y_off = float(p.get("cad_polish_y_offset_mm", 0.0))
+    x_origin = str(p.get("cad_polish_x_origin", "cut"))
+
+    if surf in ("both", "all"):
+        faces = ["front", "rear"]
+    elif surf == "rear":
+        faces = ["rear"]
+    else:
+        faces = ["front"]
+
+    written: List[Path] = []
+    if len(faces) == 2:
+        dests = [
+            path.with_name(f"{path.stem}_front{path.suffix}"),
+            path.with_name(f"{path.stem}_rear{path.suffix}"),
+        ]
+    else:
+        dests = [path]
+
+    for face, dest in zip(faces, dests):
+        jobs = []
+        for ei, spec in enumerate(specs):
+            job = polish_toolpath(
+                spec,
+                face,
+                tool_radius_mm=tool_r,
+                allowance_mm=allow,
+                stepover_mm=step,
+                strategy=strat,
+                revs_per_ring=revs,
+                x_origin=x_origin,
+            )
+            job["which"] = f"E{ei + 1} {face}"
+            jobs.append(job)
+        dest.write_text(
+            _format_polish_gcode(
+                jobs,
+                feed_mm_min=feed,
+                retract_mm=retr,
+                spindle_rpm=rpm,
+                y_offset_mm=y_off,
+            ),
+            encoding="ascii",
+        )
+        written.append(dest)
+
+    return written[0]
+
+
 def export_lens(
     params: Dict[str, Any],
     path: str | Path,
@@ -1055,6 +1708,7 @@ def export_lens(
     flange_radial_mm: float = 0.0,
     flange_thickness_mm: float = 0.0,
     emit_tube_notes: bool = True,
+    split_halves: bool = False,
 ) -> Path:
     """
     Export lens geometry. fmt in {'stl','stl_ascii','step'}.
@@ -1064,6 +1718,10 @@ def export_lens(
     - Single element → one solid
     - Multi-element stack → separate solid per element
       (STEP multi-body; STL merges shells into one file with air gaps preserved in Z)
+
+    If ``split_halves`` is set (STL only), each body is cut at the flange
+    mid-plane and written as ``*_front.stl`` / ``*_rear.stl`` so a resin
+    printer can build on that flat face and the halves can be glued.
 
     If ``max_edge_mm`` or ``max_angle_deg`` is set, polar-grid density is
     computed from those print tolerances (and overrides n_radial / n_theta).
@@ -1076,6 +1734,7 @@ def export_lens(
     fmt = fmt.lower().replace(".", "")
     fr = max(0.0, float(flange_radial_mm or 0.0))
     ft = max(0.0, float(flange_thickness_mm or 0.0))
+    do_halves = bool(split_halves) and fmt in ("stl", "stl_binary", "bin", "stl_ascii", "ascii")
 
     if max_edge_mm is not None or max_angle_deg is not None:
         n_radial, n_theta = tessellation_for_specs(
@@ -1094,6 +1753,7 @@ def export_lens(
             n_theta=n_theta,
         )
         bodies = [mesh]
+        cut_zs = [0.5 * (float(np.min(mesh.vertices[:, 2])) + float(np.max(mesh.vertices[:, 2])))]
     else:
         # One mesh body per enabled element (correct Z along the stack)
         bodies = [
@@ -1106,9 +1766,35 @@ def export_lens(
             )
             for s in specs
         ]
+        cut_zs = [flange_cut_z(s) for s in specs]
         mesh = bodies[0]
         for extra in bodies[1:]:
             mesh = mesh.merge(extra)
+
+    if do_halves:
+        if path.suffix.lower() != ".stl":
+            path = path.with_suffix(".stl")
+        writer = write_stl_ascii if fmt in ("stl_ascii", "ascii") else write_stl_binary
+        dests = half_stl_paths(path, len(bodies))
+        written: Optional[Path] = None
+        for i, body in enumerate(bodies):
+            zc = cut_zs[i] if i < len(cut_zs) else flange_cut_z(specs[min(i, len(specs) - 1)])
+            front, rear = split_mesh_at_z(body, zc)
+            fp = dests[2 * i]
+            rp = dests[2 * i + 1]
+            writer(fp, front, solid_name=f"OptiFlux_E{i + 1}_front_mm")
+            writer(rp, rear, solid_name=f"OptiFlux_E{i + 1}_rear_mm")
+            if written is None:
+                written = fp
+        if written is None:
+            raise RuntimeError("No halves to export")
+        if emit_tube_notes:
+            notes = path.with_name(path.stem + "_tube.txt")
+            write_tube_notes(
+                notes,
+                tube_layout(params, flange_radial_mm=fr, flange_thickness_mm=ft),
+            )
+        return written
 
     if fmt in ("stl", "stl_binary", "bin"):
         if path.suffix.lower() != ".stl":

@@ -26,7 +26,7 @@ In PyCharm: right-click `app.py` → **Run**.
 ### Optics
 - Up to 8 elements; **per-element** lens type library (PCX, bi-convex, meniscus, …)
 - Spherical / conic / A4, biconic and cylindrical (anamorphic) modes
-- Materials: N-BK7, flints, fused silica, acrylic, Formlabs resins, etc. (visible 380–780 nm)
+- Materials: default **Formlabs Clear Resin**; also N-BK7, flints, fused silica, acrylic, other Formlabs resins (visible 380–780 nm)
 - Snell, Fresnel T, TIR absorb (default), positive edge-thickness clamping
 
 ### Target & metrics
@@ -38,6 +38,8 @@ In PyCharm: right-click `app.py` → **Run**.
 
 ### CAD
 - Export **STL** / **STEP** in **mm**
+- Optional **print halves**: split each lens at the flange mid-plane for resin printing
+- 4-axis **polish** G-code as **`.nc`** (A = optical axis, spherical tool, Candle / GRBL)
 - Print tessellation: **max vertex length** and **max facet angle** (Optics → CAD export)
 
 ### Rectangular FOV design
@@ -47,6 +49,7 @@ In PyCharm: right-click `app.py` → **Run**.
 - Derivative-free search (SciPy differential evolution + optional Nelder–Mead polish)
 - Goals: **rectangular FOV fill**, **sharpest focus** (crisp illumination border), **maximum evenness**
 - Extra lenses are **opt-in** (checkbox) and capped (0–8, stack limit 8)
+- **Focus group on target** — slide the stack to the source-image conjugate (flashlight focus)
 - **Two-phase rectangular mode** only when extras are allowed:
   1. Even light in the FOV (flux + uniformity; circular footprint OK)
   2. Add anamorphic elements (crossed cylinders or biconic) and match footprint aspect to FOV W/H
