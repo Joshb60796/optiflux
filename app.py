@@ -54,6 +54,9 @@ from materials_catalog import (
 from lens_shapes import (
     SHAPE_DESCRIPTIONS,
     apply_shape,
+    ball_radius_from_current,
+    constrain_ball_element,
+    is_ball_shape,
     shape_dropdown_values,
     shape_id_from_label,
     shape_label_from_id,
@@ -1284,7 +1287,7 @@ class OptiFluxApp(tk.Tk):
         self._add_slider(body, "R₂ / Rₓ rear (mm)", ev["R2"], -200, 200, 0.5)
         self._add_slider(body, "R₁ᵧ front (mm) · biconic/cyl Y", ev["R1y"], -200, 200, 0.5)
         self._add_slider(body, "R₂ᵧ rear (mm) · biconic/cyl Y", ev["R2y"], -200, 200, 0.5)
-        self._add_slider(body, "Thickness (mm)", ev["thickness"], 0.2, 30, 0.1)
+        self._add_slider(body, "Thickness (mm)", ev["thickness"], 0.2, 160, 0.1)
         self._add_slider(body, "Air gap after (mm)", ev["air_after"], 0, AIR_AFTER_MAX_MM, 0.1)
         self._add_slider(
             body,
@@ -2238,6 +2241,7 @@ class OptiFluxApp(tk.Tk):
                 "Rectangular FOV fill",
                 "Sharpest focus",
                 "Maximum evenness",
+                "Collimated beam to FOV",
             ],
             width=28,
         )
@@ -2248,7 +2252,9 @@ class OptiFluxApp(tk.Tk):
                 "Rectangular FOV fill — pack a sharp rectangle into the FOV "
                 "(anamorphic extras only if allowed below).  "
                 "Sharpest focus — crispest illumination border.  "
-                "Maximum evenness — flattest light from edge to edge of the FOV."
+                "Maximum evenness — flattest light from edge to edge of the FOV.  "
+                "Collimated beam to FOV — keep rays parallel on their way into "
+                "the FOV (ball lenses help collect a 180° Lambertian die)."
             ),
             style="Dim.TLabel",
             wraplength=300,
@@ -2360,6 +2366,7 @@ class OptiFluxApp(tk.Tk):
             ("sig", "Spot RMS half-widths σx, σy"),
             ("centroid", "Centroid (X, Y)"),
             ("efl", "Element 1 EFL (lensmaker)"),
+            ("collim", "Collimation RMS (FOV rays)"),
             ("dies", "Active dies / surfaces"),
             ("tir", "TIR absorbed / reflections"),
             ("absorb", "Blocker absorbed rays"),
@@ -2460,6 +2467,8 @@ class OptiFluxApp(tk.Tk):
                 el["aperture_y"] = float(ev["aperture_y"].get())
             else:
                 el["aperture_y"] = None
+            if is_ball_shape(el.get("shape_id")):
+                constrain_ball_element(el)
             p["elements"].append(el)
         p["lens_z_start"] = float(self.v_lens_z.get())
         p["custom_n"] = float(self.v_custom_n.get())
@@ -2782,6 +2791,11 @@ class OptiFluxApp(tk.Tk):
             self.metric_labels["efl"].set(f"{efl:.2f} mm")
         else:
             self.metric_labels["efl"].set("∞")
+        if "collim" in self.metric_labels:
+            col = st.get("collimation") or {}
+            rms = float(col.get("fov_rms_deg", col.get("rms_deg", 90.0)) or 90.0)
+            n = int(col.get("n_fov") or col.get("n_samples") or 0)
+            self.metric_labels["collim"].set(f"{rms:.2f} °  ({n} rays)")
         self.metric_labels["dies"].set(f"{st['n_dies']} / {st['n_surfaces']}")
         self.metric_labels["tir"].set(
             f"{st.get('n_tir_absorb', 0)} / {st.get('n_reflections', 0)}"
@@ -3271,6 +3285,8 @@ class OptiFluxApp(tk.Tk):
             return max(1.0, min(cap, float(ap_request)))
         els[elem_index] = dict(els[elem_index])
         els[elem_index]["aperture"] = max(float(ap_request), cap)
+        if is_ball_shape(els[elem_index].get("shape_id")):
+            return max(1.0, min(cap, float(ap_request)))
         try:
             surfs = build_surfaces(
                 els,
@@ -3302,6 +3318,16 @@ class OptiFluxApp(tk.Tk):
         # so scaled MLA follows after re-trace
         old_ap = max(float(ev["aperture"].get()), 1e-6)
         ev["aperture"].set(round(ap, 3))
+        if is_ball_shape(shape_id_from_label(ev["shape"].get())):
+            ev["R1"].set(round(ap, 3))
+            ev["R2"].set(round(-ap, 3))
+            ev["thickness"].set(round(2.0 * ap, 3))
+            ev["aperture_y"].set(round(ap, 3))
+            if "R_mag" in ev:
+                ev["R_mag"].set(round(ap, 3))
+            if "circular_lock" in ev:
+                ev["circular_lock"].set(True)
+            ev["use_elliptical_ap"].set(False)
         if bool(ev.get("use_elliptical_ap") and ev["use_elliptical_ap"].get()):
             old_apy = max(float(ev["aperture_y"].get()), 1e-6)
             ratio = ap / old_ap
@@ -3885,6 +3911,24 @@ class OptiFluxApp(tk.Tk):
         Decentered MLA lenslets use the lenslet centre in that plane.
         """
         from engine import max_aperture_positive_edge
+
+        if (getattr(s1, "geom", "") or "").lower() == "sphere":
+            r = abs(float(getattr(s1, "radius", 0.0) or 0.0))
+            if r < 1e-9:
+                r = max(float(s1.aperture), 0.2)
+            zc = float(s1.z_vertex) + float(s1.radius) + z_off
+            t0 = float(s1.x0) if str(plane).lower().startswith("x") else float(s1.y0)
+            ncirc = 16 if compact else 64
+            zz, tt = [], []
+            for i in range(ncirc + 1):
+                a = 2.0 * math.pi * i / ncirc
+                zz.append(zc - r * math.cos(a))
+                tt.append(t0 + r * math.sin(a))
+            col = "#fbbf24" if highlight else LENS
+            lw = 1.2 if compact else (2.0 if highlight else 1.8)
+            ax.fill(zz, tt, color=col, alpha=0.22 if not highlight else 0.35, zorder=3)
+            ax.plot(zz, tt, color=col, lw=lw, zorder=4)
+            return
 
         # Tiny lenslets: allow thinner edge for drawing/trace clamp
         min_edge = 0.05 if compact else 0.25
@@ -5261,6 +5305,8 @@ class OptiFluxApp(tk.Tk):
             return "focus"
         if label.startswith("Maximum"):
             return "evenness"
+        if label.startswith("Collimated"):
+            return "collimate"
         return "rect_fill"
 
     def run_optimize_current(self):
@@ -5318,6 +5364,9 @@ class OptiFluxApp(tk.Tk):
         elif objective == "evenness":
             panel = "Maximum evenness: flattening FOV irradiance edge-to-edge…"
             status = "Optimizing evenness…"
+        elif objective == "collimate":
+            panel = "Collimated beam: minimizing divergence of rays into the FOV…"
+            status = "Optimizing collimation…"
         else:
             panel = "Rectangular fill on the current stack (no extra lenses)…"
             status = "Optimizing rectangular FOV…"
@@ -6089,7 +6138,18 @@ class OptiFluxApp(tk.Tk):
             self._on_param_change()
             return
 
-        r_mag = float(ev["R_mag"].get())
+        if sid == "ball":
+            # Do not inherit leftover |R1|/|R2| from a PCX/biconvex (often 40–50 mm).
+            # A 10 mm singlet becomes a 10 mm-radius sphere.
+            r_mag = ball_radius_from_current(
+                aperture=float(ev["aperture"].get()),
+                r_mag=float(ev["R_mag"].get()),
+                R1=float(ev["R1"].get()),
+                R2=float(ev["R2"].get()),
+                thickness=float(ev["thickness"].get()),
+            )
+        else:
+            r_mag = float(ev["R_mag"].get())
         el = apply_shape(
             sid,
             R_mag=r_mag,
@@ -6113,12 +6173,27 @@ class OptiFluxApp(tk.Tk):
         # Keep Element 1 design aperture full-size. MLA maps it to die pitch via
         # scale_to_pitch — shrinking here left R macro-sized → flat cylinders.
 
+        skip = ("shape_id", "surface_mode", "mode_s1", "mode_s2", "R1y", "R2y")
         for k, v in el.items():
-            if k in ev and k not in ("shape_id", "surface_mode", "mode_s1", "mode_s2", "R1y", "R2y"):
+            if k not in ev or k in skip or v is None:
+                continue
+            try:
                 ev[k].set(v)
+            except (tk.TclError, TypeError, ValueError):
+                continue
         ev["surface_mode"].set("rotational")
         ev["enabled"].set(True)
         ev["use_elliptical_ap"].set(False)
+        if sid == "ball":
+            r = float(el["aperture"])
+            ev["R1"].set(r)
+            ev["R2"].set(-r)
+            ev["thickness"].set(2.0 * r)
+            ev["aperture"].set(r)
+            ev["aperture_y"].set(r)
+            ev["R_mag"].set(r)
+            if "circular_lock" in ev:
+                ev["circular_lock"].set(True)
         desc = SHAPE_DESCRIPTIONS.get(sid, "")
         self.status_var.set(f"Element {elem_index + 1}: {ev['shape'].get()}" + (f" — {desc}" if desc else ""))
         self._on_param_change()

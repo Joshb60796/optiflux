@@ -533,8 +533,11 @@ class TestAnamorphicRectFOV(unittest.TestCase):
 
     def test_rect_fov_sim_aspect_direction(self):
         """Wider FOV design should produce footprint aspect > 1 (σx > σy)."""
+        import random
+
         from rect_fov import design_crossed_cylinders_for_rect_fov
 
+        random.seed(11)
         d = design_crossed_cylinders_for_rect_fov(
             fov_width=60, fov_height=30, target_z=120, aperture=12
         )

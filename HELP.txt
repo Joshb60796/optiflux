@@ -192,8 +192,17 @@ Copy from
   the duplicate.
 
 Lens type
-  Library starting shapes (plano-convex, biconvex, …) that set R1/R2 signs
-  and proportions. Custom leaves radii fully free.
+  Library starting shapes (plano-convex, biconvex, ball, …) that set R1/R2
+  signs and proportions. Custom leaves radii fully free.
+
+Ball lens (full sphere)
+  A complete glass/plastic sphere. |R| is the radius: thickness becomes 2R
+  and the clear semi-aperture becomes R. Sequential tracing uses the shared
+  sphere (enter the source-facing hemisphere, exit the far side). CAD
+  exports a true sphere (no print flange). Balls collect a wide Lambertian
+  cone from a surface emitter — set emission half-angle to 90° for a full
+  180° hemisphere — and are a classic collimator when the source sits near
+  the front focal point (n R / (2(n−1)) − R from the first vertex).
 
 |R| magnitude
   Scales library-type radii while preserving the shape family.
@@ -335,6 +344,9 @@ Goal
   (does not add lenses).
   Maximum evenness — flatten irradiance from edge to edge of the FOV
   (does not add lenses).
+  Collimated beam to FOV — minimize the angular spread of rays that
+  reach the FOV so the beam stays parallel on the throw. Does not add
+  lenses. A ball near the source is a good starting point.
 
 Allow adding lenses
   Off by default. When on, rectangular fill injects extra elements
@@ -345,8 +357,8 @@ Allow adding lenses
 
 Max extra lenses
   0–8. 1 = biconic singlet; 2 = crossed cylinders (X then Y);
-  3+ adds relay / field elements. Unused if the goal is focus or
-  evenness, or if “Allow adding lenses” is off.
+  3+ adds relay / field elements. Unused if the goal is focus,
+  evenness, or collimated beam, or if “Allow adding lenses” is off.
 
 Aspect-match / fill / uniformity weights
   How strongly the score penalizes wrong footprint aspect, under-sized
@@ -359,6 +371,10 @@ Rays per evaluation / Max evaluations
 --------------------------------------------------------------------------
 METRICS (READOUTS)
 --------------------------------------------------------------------------
+
+Collimation RMS (FOV rays)
+  Power-weighted RMS angle of target-plane rays (preferring those inside
+  the FOV) from their mean direction. 0° is a perfectly parallel bundle.
 
 Collection efficiency
   Power inside the rectangular FOV divided by source power. Light that

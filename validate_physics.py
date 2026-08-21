@@ -50,6 +50,7 @@ def run_all(*, with_coverage: bool = False):
     import test_polish_cnc  # noqa: F401
     import test_polish_lap  # noqa: F401
     import test_focus_group  # noqa: F401
+    import test_ball_lens  # noqa: F401
 
     loader = unittest.TestLoader()
     suite = unittest.TestSuite()
@@ -75,6 +76,7 @@ def run_all(*, with_coverage: bool = False):
     suite.addTests(loader.loadTestsFromModule(test_polish_cnc))
     suite.addTests(loader.loadTestsFromModule(test_polish_lap))
     suite.addTests(loader.loadTestsFromModule(test_focus_group))
+    suite.addTests(loader.loadTestsFromModule(test_ball_lens))
     runner = unittest.TextTestRunner(verbosity=2)
     result = runner.run(suite)
 

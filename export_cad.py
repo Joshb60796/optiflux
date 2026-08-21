@@ -90,6 +90,7 @@ class LensSpec:
     R2y: Optional[float] = None
     mode: str = "rotational"
     aperture_y: Optional[float] = None
+    shape_id: str = ""
 
 
 @dataclass
@@ -318,6 +319,78 @@ def _circle_ring(
     return pts
 
 
+def is_ball_spec(spec: LensSpec) -> bool:
+    """True if this singlet is a full sphere (ball lens)."""
+    if str(getattr(spec, "shape_id", "") or "").strip().lower() == "ball":
+        return True
+    try:
+        r1 = float(spec.R1)
+        r2 = float(spec.R2)
+        thick = float(spec.thickness)
+    except (TypeError, ValueError):
+        return False
+    if r1 <= 0.2 or r2 >= -0.2:
+        return False
+    if abs(r1 + r2) > 1e-3 * max(r1, 1.0):
+        return False
+    return abs(thick - 2.0 * r1) < max(0.2, 0.03 * r1)
+
+
+def mesh_ball(
+    spec: LensSpec,
+    n_radial: int = 24,
+    n_theta: int = 48,
+) -> Mesh:
+    """Closed UV-sphere solid. Front pole is the first vertex (−Z)."""
+    r1 = abs(float(spec.R1) or 0.0)
+    r = r1 if r1 > 1e-9 else 0.5 * abs(float(spec.thickness) or 0.0)
+    r = max(r, 1e-3)
+    zc = float(spec.z_front) + r
+    x0 = float(spec.x0)
+    y0 = float(spec.y0)
+    n_lat = max(8, int(n_radial))
+    n_lon = max(12, int(n_theta))
+    if n_lon % 2:
+        n_lon += 1
+
+    verts: List[Tuple[float, float, float]] = [(x0, y0, zc - r)]
+    for i in range(1, n_lat):
+        phi = math.pi * i / n_lat
+        cz = zc - r * math.cos(phi)
+        rs = r * math.sin(phi)
+        for j in range(n_lon):
+            th = 2.0 * math.pi * j / n_lon
+            verts.append((x0 + rs * math.cos(th), y0 + rs * math.sin(th), cz))
+    verts.append((x0, y0, zc + r))
+    v = np.asarray(verts, dtype=np.float64)
+
+    faces: List[Tuple[int, int, int]] = []
+    for j in range(n_lon):
+        a = 1 + j
+        b = 1 + (j + 1) % n_lon
+        faces.append((0, a, b))
+    for i in range(n_lat - 2):
+        base = 1 + i * n_lon
+        nxt = 1 + (i + 1) * n_lon
+        for j in range(n_lon):
+            i0 = base + j
+            i1 = base + (j + 1) % n_lon
+            j0 = nxt + j
+            j1 = nxt + (j + 1) % n_lon
+            faces.append((i0, j0, j1))
+            faces.append((i0, j1, i1))
+    rear = len(v) - 1
+    last = 1 + (n_lat - 2) * n_lon
+    for j in range(n_lon):
+        a = last + j
+        b = last + (j + 1) % n_lon
+        faces.append((rear, b, a))
+    mesh = Mesh(v, np.asarray(faces, dtype=np.int32))
+    if mesh_signed_volume(mesh) < 0.0:
+        mesh.faces = mesh.faces[:, ::-1].copy()
+    return mesh
+
+
 def mesh_singlet(
     spec: LensSpec,
     n_radial: int = 48,
@@ -329,6 +402,8 @@ def mesh_singlet(
     Closed solid mesh of a decentered singlet.
     Front surface outward normals ≈ −Z, rear ≈ +Z, rim radial.
     """
+    if is_ball_spec(spec):
+        return mesh_ball(spec, n_radial=n_radial, n_theta=n_theta)
     ap = max(1e-3, float(spec.aperture))
     z1 = float(spec.z_front)
     # rear vertex
@@ -804,6 +879,7 @@ def stack_singlet_specs(params: Dict[str, Any]) -> List[LensSpec]:
                 R2y=float(r2y) if r2y is not None else None,
                 mode=str(e.get("surface_mode", "rotational")),
                 aperture_y=float(apy) if apy is not None else None,
+                shape_id=str(e.get("shape_id") or ""),
             )
         )
         z += thick + float(e.get("air_after", 0.0))
@@ -1776,8 +1852,8 @@ def export_lens(
                 s,
                 n_radial=n_radial,
                 n_theta=n_theta,
-                flange_radial_mm=fr,
-                flange_thickness_mm=ft,
+                flange_radial_mm=0.0 if is_ball_spec(s) else fr,
+                flange_thickness_mm=0.0 if is_ball_spec(s) else ft,
             )
             for s in specs
         ]

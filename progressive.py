@@ -24,10 +24,12 @@ from engine import (
     SimResult,
     VISIBLE_NM_DEFAULT,
     assemble_surfaces,
-    blockers_need_cpu,
     build_source_array,
+    collimation_metrics,
+    empty_collimation,
     lensmaker_f,
     refractive_index,
+    trace_needs_cpu,
     trace_ray,
 )
 
@@ -66,6 +68,7 @@ def _empty_stats() -> Dict[str, Any]:
         "backend": "cpu",
         "batch": 0,
         "n_batches": 0,
+        "collimation": empty_collimation(),
     }
 
 
@@ -86,6 +89,7 @@ def _finalize_stats(
     backend: str = "cpu",
     batch_i: int = 0,
     n_batches: int = 1,
+    collimation: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Build stats for the progressive run.
@@ -160,6 +164,7 @@ def _finalize_stats(
         "backend": backend,
         "batch": batch_i,
         "n_batches": n_batches,
+        "collimation": collimation if collimation is not None else empty_collimation(),
     }
 
 
@@ -178,6 +183,7 @@ def _trace_cpu_batch(
     kill_backward: bool,
     imap: IrradianceMap,
     accumulate_map: bool = True,
+    collimation_acc: Optional[List] = None,
 ) -> Tuple[List[RayPath], int, int, int, int, int, int, int]:
     """Trace a CPU batch. Returns (paths, launched, hit, tir, absorb, refl, back, miss)."""
     paths: List[RayPath] = []
@@ -234,6 +240,10 @@ def _trace_cpu_batch(
         if accumulate_map and ok and pt is not None:
             hit += 1
             imap.deposit(pt[0], pt[1], pwr_out)
+        if ok and pt is not None and path is not None and collimation_acc is not None:
+            fd = getattr(path, "final_dir", None)
+            if fd is not None:
+                collimation_acc.append((fd[0], fd[1], fd[2], pwr_out, pt[0], pt[1]))
         if store and path is not None and len(path.history) >= 2:
             paths.append(path)
     return paths, launched, hit, n_tir, n_absorb, n_reflect, n_backward, n_miss
@@ -348,7 +358,7 @@ def run_simulation_progressive(
     max_refl = int(params.get("max_reflections", 0))
     kill_backward = bool(params.get("kill_backward", True))
     use_warp = bool(params.get("use_warp", True))
-    if use_warp and blockers_need_cpu(surfaces):
+    if use_warp and trace_needs_cpu(surfaces):
         use_warp = False
 
     active = [d for d in dies if d.enabled and d.flux > 0]
@@ -364,6 +374,7 @@ def run_simulation_progressive(
     n_tir = n_absorb = n_reflect = n_backward = n_miss = 0
     backend = "cpu"
     paths: List[RayPath] = []
+    col_acc: List = []
     final: Optional[SimResult] = None
 
     for bi in range(n_batches):
@@ -412,6 +423,7 @@ def run_simulation_progressive(
                 kill_backward=kill_backward,
                 imap=imap,
                 accumulate_map=True,
+                collimation_acc=col_acc,
             )
             batch_launched = bl
             batch_hit = bh
@@ -441,6 +453,7 @@ def run_simulation_progressive(
                 kill_backward=kill_backward,
                 imap=imap,
                 accumulate_map=False,
+                collimation_acc=col_acc,
             )
             paths = new_paths
             n_tir += t2
@@ -465,6 +478,13 @@ def run_simulation_progressive(
             backend=backend,
             batch_i=bi + 1,
             n_batches=n_batches,
+            collimation=collimation_metrics(
+                col_acc,
+                fov_width=float(params.get("fov_width", 40.0)),
+                fov_height=float(params.get("fov_height", 32.0)),
+                fov_cx=fov_cx,
+                fov_cy=fov_cy,
+            ),
         )
         final = SimResult(imap, list(paths), stats, dies, surfaces)
         if batch_cb:

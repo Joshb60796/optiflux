@@ -8,7 +8,7 @@ from __future__ import annotations
 import math
 import random
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple, Dict, Any
+from typing import List, Optional, Sequence, Tuple, Dict, Any
 
 Vec3 = Tuple[float, float, float]
 
@@ -55,6 +55,7 @@ from materials_catalog import (  # noqa: E402
     refractive_index,
     resolve_material_id,
 )
+from lens_shapes import constrain_ball_element, is_ball_element  # noqa: E402
 
 # UI list: human-readable names (Edmund-style + acrylic + Formlabs)
 MATERIAL_NAMES = material_display_names()
@@ -194,6 +195,9 @@ class OpticalSurface:
     plane_offset: float = 0.0  # signed offset from x0/y0/z_vertex for plane_* geoms
     # Half-length along optical Z for baffles & tubes (mm); full length = 2 * extent_z
     extent_z: float = 10.0
+    # Ball lens: analytic sphere. "near" = first hit (front), "far" = second hit
+    # from inside the glass (rear). Ignored unless geom == "sphere".
+    sphere_select: str = "near"
 
     def curvature(self) -> float:
         return _curv(self.radius)
@@ -331,6 +335,12 @@ class OpticalSurface:
         if g == "cylinder_z":
             lx, ly = self.local_xy(x, y)
             return v_norm((lx, ly, 0.0)) if math.hypot(lx, ly) > 1e-15 else (1.0, 0.0, 0.0)
+        if g == "sphere":
+            zc = self.surface_z(x, y)
+            if zc is None:
+                zc = self.z_vertex
+            n = v_norm((x - self.x0, y - self.y0, zc - (self.z_vertex + self.radius)))
+            return n if n != (0.0, 0.0, 0.0) else (0.0, 0.0, 1.0)
         eps = 1e-5
         zc = self.surface_z(x, y)
         if zc is None:
@@ -455,6 +465,57 @@ class OpticalSurface:
             return t, p, n if n != (0.0, 0.0, 0.0) else (1.0, 0.0, 0.0)
         return None
 
+    def _intersect_sphere(self, o: Vec3, d: Vec3, t_min: float, t_max: float):
+        """
+        Analytic sphere. Centre is at the vertex plus the signed radius, so
+        front (R>0) and rear (R<0) of a ball share one centre.
+
+        near — first intersection (air → glass on the source-facing hemisphere)
+        far  — second intersection, only when the origin is already inside
+               (prevents grazing the back of the ball from air)
+        """
+        R = float(self.radius)
+        if abs(R) < 1e-12:
+            return None
+        cx, cy = self.x0, self.y0
+        cz = self.z_vertex + R
+        ocx = o[0] - cx
+        ocy = o[1] - cy
+        ocz = o[2] - cz
+        a = d[0] * d[0] + d[1] * d[1] + d[2] * d[2]
+        if a < 1e-16:
+            return None
+        b = 2.0 * (ocx * d[0] + ocy * d[1] + ocz * d[2])
+        c = ocx * ocx + ocy * ocy + ocz * ocz - R * R
+        disc = b * b - 4.0 * a * c
+        if disc < 0.0:
+            return None
+        sdisc = math.sqrt(disc)
+        inv = 0.5 / a
+        t_near = (-b - sdisc) * inv
+        t_far = (-b + sdisc) * inv
+        if t_near > t_far:
+            t_near, t_far = t_far, t_near
+        select = (self.sphere_select or "near").lower()
+        r2_orig = ocx * ocx + ocy * ocy + ocz * ocz
+        r2 = R * R
+        if select == "far":
+            if r2_orig > r2 + 1e-6:
+                return None
+            t = t_far
+        else:
+            t = t_near
+        if t < t_min or t > t_max:
+            return None
+        p = v_add(o, v_scale(d, t))
+        lx, ly = self.local_xy(p[0], p[1])
+        if not self.in_hit_region(lx, ly):
+            return None
+        n = v_norm((p[0] - cx, p[1] - cy, p[2] - cz))
+        if n == (0.0, 0.0, 0.0):
+            n = (0.0, 0.0, 1.0 if R < 0.0 else -1.0)
+        return t, p, n
+
     def intersect(self, o: Vec3, d: Vec3, t_min: float = 1e-6, t_max: float = 1e6):
         if not self.active:
             return None
@@ -467,6 +528,8 @@ class OpticalSurface:
             return self._intersect_plane_x(o, d, t_min, t_max)
         if g == "cylinder_z":
             return self._intersect_cylinder_z(o, d, t_min, t_max)
+        if g == "sphere":
+            return self._intersect_sphere(o, d, t_min, t_max)
 
         # Default: asphere Newton intersect
         t = (self.z_vertex - o[2]) / d[2] if abs(d[2]) > 1e-12 else t_min + 0.1
@@ -686,21 +749,28 @@ def build_surfaces(
             s2 = _surface_from_element(
                 e_lens, side=2, z=z2, ap=ap_use, glass=mat, label=f"MLA{li}S2", x0=x0, y0=y0
             )
-            _clamp_pair_aperture(s1, s2, ap_use, min_edge=0.08)
+            if is_ball_element(e_lens):
+                s1.aperture = s2.aperture = ap_use
+            else:
+                _clamp_pair_aperture(s1, s2, ap_use, min_edge=0.08)
             surfaces.extend([s1, s2])
         # Optional additional on-axis stack elements after MLA air gap
         z = z2 + float(e0.get("air_after", 1.0))
         for i, e in enumerate(elements[1:], start=1):
             if not e.get("enabled", True):
                 continue
-            ap2 = float(e.get("aperture", 12.0))
-            mat2 = material_id_from_name(str(e.get("material", "N_BK7")))
-            s1 = _surface_from_element(e, side=1, z=z, ap=ap2, glass=mat2, label=f"E{i+1}S1")
-            z += float(e.get("thickness", 3.0))
-            s2 = _surface_from_element(e, side=2, z=z, ap=ap2, glass=mat2, label=f"E{i+1}S2")
-            _clamp_pair_aperture(s1, s2, ap2)
+            e_use = constrain_ball_element(dict(e)) if is_ball_element(e) else e
+            ap2 = float(e_use.get("aperture", 12.0))
+            mat2 = material_id_from_name(str(e_use.get("material", "N_BK7")))
+            s1 = _surface_from_element(e_use, side=1, z=z, ap=ap2, glass=mat2, label=f"E{i+1}S1")
+            z += float(e_use.get("thickness", 3.0))
+            s2 = _surface_from_element(e_use, side=2, z=z, ap=ap2, glass=mat2, label=f"E{i+1}S2")
+            if is_ball_element(e_use):
+                s1.aperture = s2.aperture = ap2
+            else:
+                _clamp_pair_aperture(s1, s2, ap2)
             surfaces.extend([s1, s2])
-            z += float(e.get("air_after", 2.0))
+            z += float(e_use.get("air_after", 2.0))
         return surfaces
 
     # Conventional centered stack
@@ -708,14 +778,18 @@ def build_surfaces(
     for i, e in enumerate(elements):
         if not e.get("enabled", True):
             continue
-        ap = float(e.get("aperture", 12.0))
-        mat = material_id_from_name(str(e.get("material", "N_BK7")))
-        s1 = _surface_from_element(e, side=1, z=z, ap=ap, glass=mat, label=f"E{i+1}S1")
-        z += float(e.get("thickness", 3.0))
-        s2 = _surface_from_element(e, side=2, z=z, ap=ap, glass=mat, label=f"E{i+1}S2")
-        _clamp_pair_aperture(s1, s2, ap)
+        e_use = constrain_ball_element(dict(e)) if is_ball_element(e) else e
+        ap = float(e_use.get("aperture", 12.0))
+        mat = material_id_from_name(str(e_use.get("material", "N_BK7")))
+        s1 = _surface_from_element(e_use, side=1, z=z, ap=ap, glass=mat, label=f"E{i+1}S1")
+        z += float(e_use.get("thickness", 3.0))
+        s2 = _surface_from_element(e_use, side=2, z=z, ap=ap, glass=mat, label=f"E{i+1}S2")
+        if is_ball_element(e_use):
+            s1.aperture = s2.aperture = ap
+        else:
+            _clamp_pair_aperture(s1, s2, ap)
         surfaces.extend([s1, s2])
-        z += float(e.get("air_after", 2.0))
+        z += float(e_use.get("air_after", 2.0))
     return surfaces
 
 
@@ -941,6 +1015,19 @@ def blockers_need_cpu(surfaces: List[OpticalSurface]) -> bool:
     return False
 
 
+def sphere_surfaces_present(surfaces: List[OpticalSurface]) -> bool:
+    """True if any refractive surface is an analytic sphere (ball lens)."""
+    for s in surfaces:
+        if (getattr(s, "geom", "asphere") or "asphere").lower() == "sphere":
+            return True
+    return False
+
+
+def trace_needs_cpu(surfaces: List[OpticalSurface]) -> bool:
+    """Warp kernel has no analytic sphere or baffle/tube intersection."""
+    return blockers_need_cpu(surfaces) or sphere_surfaces_present(surfaces)
+
+
 def assemble_surfaces(
     elements: List[Dict[str, Any]],
     z_start: float,
@@ -1007,6 +1094,9 @@ def max_aperture_positive_edge(
     and keeps resize handles locked to the drawable lens body.
     """
     ap_request = max(float(ap_request), 1e-3)
+    if (getattr(s_front, "geom", "") or "").lower() == "sphere":
+        r = abs(float(getattr(s_front, "radius", 0.0) or 0.0))
+        return min(ap_request, r if r > 1e-9 else ap_request)
     best = 0.0
     for i in range(1, samples + 1):
         r = ap_request * i / samples
@@ -1062,7 +1152,7 @@ def _surface_from_element(
         mat_before, mat_after = glass, "AIR"
 
     sm = str(e.get(f"mode_s{side}", mode))
-
+    ball = is_ball_element(e)
     return OpticalSurface(
         z_vertex=z,
         radius=Rx,
@@ -1079,6 +1169,8 @@ def _surface_from_element(
         a4_y=a4y,
         mode=sm,
         aperture_y=ap_y_f,
+        geom="sphere" if ball else "asphere",
+        sphere_select="near" if side == 1 else "far",
     )
 
 
@@ -1123,6 +1215,8 @@ class RayPath:
     terminated: str = ""  # target | tir_absorb | absorb | miss | power | bounce_limit | backward
     # Distinct element ids (E1, E2, MLA0, …) that this ray refracted through
     elements_hit: List[str] = field(default_factory=list)
+    # Direction at termination (unit vector). Used for collimation metrics.
+    final_dir: Optional[Vec3] = None
 
 
 @dataclass
@@ -1500,17 +1594,16 @@ def trace_ray(
     n_refr = 0
     guard = 0
 
-    def _path(term: str, pwr: float = power) -> Optional[RayPath]:
-        if not store_path:
-            return None
+    def _path(term: str, pwr: float = power) -> RayPath:
         return RayPath(
-            history=history,
+            history=history if store_path else [],
             power=pwr,
-            events=list(events),
+            events=list(events) if store_path else [],
             n_reflections=n_refl,
             n_refractions=n_refr,
             terminated=term,
-            elements_hit=list(elements_hit),
+            elements_hit=list(elements_hit) if store_path else [],
+            final_dir=d,
         )
 
     while guard < max_interactions:
@@ -1655,6 +1748,92 @@ def target_plane_hits(
     return hits
 
 
+def empty_collimation() -> Dict[str, Any]:
+    return {
+        "rms_deg": 90.0,
+        "rms_axis_deg": 90.0,
+        "fov_rms_deg": 90.0,
+        "mean_dir": (0.0, 0.0, 1.0),
+        "n_samples": 0,
+        "n_fov": 0,
+        "power": 0.0,
+        "fov_power": 0.0,
+    }
+
+
+def collimation_metrics(
+    samples: Sequence[Tuple[float, float, float, float, float, float]],
+    *,
+    fov_width: float = 0.0,
+    fov_height: float = 0.0,
+    fov_cx: float = 0.0,
+    fov_cy: float = 0.0,
+) -> Dict[str, Any]:
+    """
+    Power-weighted collimation of rays that reached the target plane.
+
+    Each sample is (dx, dy, dz, power, x, y). ``rms_deg`` is the RMS angle
+    from the mean direction (true collimation). ``fov_rms_deg`` uses only
+    samples inside the FOV rectangle.
+    """
+    out = empty_collimation()
+    if not samples:
+        return out
+
+    def _stats(subset: Sequence[Tuple[float, float, float, float, float, float]]):
+        wsum = 0.0
+        acc = [0.0, 0.0, 0.0]
+        unit: List[Tuple[Vec3, float]] = []
+        for dx, dy, dz, pwr, _x, _y in subset:
+            if pwr <= 0.0:
+                continue
+            L = math.hypot(dx, dy, dz)
+            if L < 1e-15:
+                continue
+            u = (dx / L, dy / L, dz / L)
+            acc[0] += pwr * u[0]
+            acc[1] += pwr * u[1]
+            acc[2] += pwr * u[2]
+            wsum += pwr
+            unit.append((u, pwr))
+        if wsum <= 0.0 or not unit:
+            return 90.0, 90.0, (0.0, 0.0, 1.0), 0.0
+        mean = v_norm((acc[0], acc[1], acc[2]))
+        if mean == (0.0, 0.0, 0.0):
+            mean = (0.0, 0.0, 1.0)
+        acc2 = 0.0
+        acc2_axis = 0.0
+        for u, pwr in unit:
+            c = max(-1.0, min(1.0, v_dot(u, mean)))
+            acc2 += pwr * math.acos(c) ** 2
+            c0 = max(-1.0, min(1.0, u[2]))
+            acc2_axis += pwr * math.acos(c0) ** 2
+        rms = math.degrees(math.sqrt(acc2 / wsum))
+        rms_axis = math.degrees(math.sqrt(acc2_axis / wsum))
+        return rms, rms_axis, mean, wsum
+
+    rms, rms_axis, mean, wsum = _stats(samples)
+    out["rms_deg"] = rms
+    out["rms_axis_deg"] = rms_axis
+    out["mean_dir"] = mean
+    out["n_samples"] = len(samples)
+    out["power"] = wsum
+
+    hw = 0.5 * abs(float(fov_width))
+    hh = 0.5 * abs(float(fov_height))
+    fov_s = []
+    if hw > 1e-12 and hh > 1e-12:
+        for s in samples:
+            if abs(s[4] - fov_cx) <= hw + 1e-12 and abs(s[5] - fov_cy) <= hh + 1e-12:
+                fov_s.append(s)
+    if fov_s:
+        fov_rms, _fa, _fm, fov_w = _stats(fov_s)
+        out["fov_rms_deg"] = fov_rms
+        out["n_fov"] = len(fov_s)
+        out["fov_power"] = fov_w
+    return out
+
+
 @dataclass
 class SimResult:
     map: IrradianceMap
@@ -1707,12 +1886,13 @@ def run_simulation(params: Dict[str, Any], progress_cb=None) -> SimResult:
     fov_w = float(params.get("fov_width", 40.0))
     fov_h = float(params.get("fov_height", 32.0))
     use_warp = bool(params.get("use_warp", True))
-    # Cylinders / horizontal baffles are CPU-traced (Warp path is Z-plane only)
-    if use_warp and blockers_need_cpu(surfaces):
+    # Cylinders / baffles / analytic ball spheres are CPU-traced
+    if use_warp and trace_needs_cpu(surfaces):
         use_warp = False
 
     active = [d for d in dies if d.enabled and d.flux > 0]
     paths: List[RayPath] = []
+    col_samples: List[Tuple[float, float, float, float, float, float]] = []
     if not active or total_rays < 1:
         stats = _empty_stats()
         return SimResult(imap, paths, stats, dies, surfaces)
@@ -1804,6 +1984,10 @@ def run_simulation(params: Dict[str, Any], progress_cb=None) -> SimResult:
         if warp_grid is None and ok and pt is not None:
             hit += 1
             imap.deposit(pt[0], pt[1], pwr_out)
+        if ok and pt is not None and path is not None:
+            fd = getattr(path, "final_dir", None)
+            if fd is not None:
+                col_samples.append((fd[0], fd[1], fd[2], pwr_out, pt[0], pt[1]))
         if store and path is not None and len(path.history) >= 2:
             paths.append(path)
         if progress_cb and warp_grid is None and (i % batch == 0 or i == n_python - 1):
@@ -1854,6 +2038,13 @@ def run_simulation(params: Dict[str, Any], progress_cb=None) -> SimResult:
         "n_backward": n_backward,
         "n_miss": n_miss,
         "backend": backend,
+        "collimation": collimation_metrics(
+            col_samples,
+            fov_width=fov_w,
+            fov_height=fov_h,
+            fov_cx=fov_cx,
+            fov_cy=fov_cy,
+        ),
     }
     return SimResult(imap, paths, stats, dies, surfaces)
 
@@ -1889,6 +2080,7 @@ def _empty_stats() -> Dict[str, Any]:
         "n_reflections": 0,
         "n_backward": 0,
         "n_miss": 0,
+        "collimation": empty_collimation(),
     }
 
 

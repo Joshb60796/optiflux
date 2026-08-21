@@ -14,6 +14,7 @@ Goals (`OptimizeConfig.objective`):
   rect_fill — filled rectangle (default)
   focus     — sharpest illumination border
   evenness  — flattest FOV irradiance
+  collimate — rays traveling to the FOV as parallel as possible
 
 Uses SciPy differential evolution + optional Nelder–Mead polish.
 
@@ -34,6 +35,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from engine import default_params, run_simulation
+from lens_shapes import constrain_ball_element, is_ball_element
 
 
 # ── Configuration ─────────────────────────────────────────────────────────────
@@ -72,8 +74,10 @@ class OptimizeConfig:
     extra_anamorphic_lenses: int = 2  # 0–8 additional elements in phase 2 (stack-capped)
     anamorphic_mode: str = "crossed"  # "crossed" | "biconic"
     phase1_eval_fraction: float = 0.45  # share of max_evals for phase 1
-    # Goal: "rect_fill" | "focus" | "evenness"
+    # Goal: "rect_fill" | "focus" | "evenness" | "collimate"
     objective: str = "rect_fill"
+    # Characteristic RMS divergence (deg) for the collimate goal
+    collimation_scale_deg: float = 2.0
     # When False, never inject extra elements (even if two_phase / extra > 0)
     allow_extra_lenses: bool = True
     # Which free variables to include
@@ -121,6 +125,11 @@ _OBJECTIVE_ALIASES = {
     "even": "evenness",
     "evenness": "evenness",
     "uniform": "evenness",
+    "collimate": "collimate",
+    "collimated": "collimate",
+    "collimation": "collimate",
+    "collimated_beam": "collimate",
+    "collimated_beam_to_fov": "collimate",
 }
 
 
@@ -172,6 +181,13 @@ def config_from_panel(
         cov = 0.95
         spill = 1.2
         waste = 0.6
+    elif obj == "collimate":
+        uni_w = max(0.0, float(uniformity_weight) * 0.4)
+        asp_w = 0.0
+        fill_w = max(0.6, float(fill_weight) * 0.6)
+        cov = 0.7
+        spill = 1.0
+        waste = 0.8
     else:
         uni_w = float(uniformity_weight)
         asp_w = float(aspect_weight)
@@ -290,6 +306,28 @@ def build_variable_list(
             5.0,
         )
 
+        if is_ball_element(e):
+            r = abs(float(e.get("R1") or 5.0))
+            r = max(r, 0.5)
+            if cfg.optimize_radii:
+                vars_.append(
+                    _Var(
+                        f"elements.{i}.R1",
+                        max(1.0, r * 0.4),
+                        min(80.0, max(r * 2.5, 8.0)),
+                    )
+                )
+            if cfg.optimize_air_gaps:
+                air = float(e.get("air_after", 1.0))
+                vars_.append(
+                    _Var(
+                        f"elements.{i}.air_after",
+                        0.05,
+                        min(40.0, max(air * 3.0, air + 8.0)),
+                    )
+                )
+            continue
+
         if cfg.optimize_radii:
             # Allow sign-preserving radius moves over a wide range
             for key in ("R1", "R2"):
@@ -374,9 +412,14 @@ def apply_vector(base: Dict[str, Any], vars_: Sequence[_Var], x: Sequence[float]
     p = copy.deepcopy(base)
     for var, val in zip(vars_, x):
         _set_path(p, var.name, float(val))
-    # Keep shape_id as custom when radii move
-    for e in p.get("elements", []):
-        if e.get("enabled", True):
+    base_elems = list(base.get("elements") or [])
+    for i, e in enumerate(p.get("elements") or []):
+        if not e.get("enabled", True):
+            continue
+        was_ball = i < len(base_elems) and is_ball_element(base_elems[i])
+        if was_ball or is_ball_element(e):
+            constrain_ball_element(e)
+        else:
             e["shape_id"] = "custom"
     return p
 
@@ -408,6 +451,10 @@ def _geometry_penalty(params: Dict[str, Any], scale: float) -> float:
 
         if thick < 0.3:
             pen += (0.3 - thick) * 5.0
+
+        if is_ball_element(e):
+            z += thick + air
+            continue
 
         # Domain of spherical surface: |R| must exceed clear aperture
         for R in (R1, R2, e.get("R1y"), e.get("R2y")):
@@ -710,6 +757,26 @@ def evaluate_fov_flux(
         w_s = float(cfg.fill_weight)
         if w_s > 0:
             score = score / (1.0 + w_s * size_error)
+        score -= _geometry_penalty(p, cfg.penalty_scale)
+        return score, fov_flux, uniformity, collection, aspect_error, footprint_aspect
+
+    if objective == "collimate":
+        col = st.get("collimation") or {}
+        n_fov = int(col.get("n_fov") or 0)
+        if n_fov >= 3:
+            rms = float(col.get("fov_rms_deg", 90.0) or 90.0)
+        else:
+            rms = float(col.get("rms_deg", 90.0) or 90.0)
+        if not math.isfinite(rms):
+            rms = 90.0
+        scale = max(0.2, float(getattr(cfg, "collimation_scale_deg", 2.0) or 2.0))
+        collim_factor = 1.0 / (1.0 + (max(0.0, rms) / scale) ** 2)
+        flux_keep = 0.15 + 0.85 * min(1.0, fov_flux / 0.30)
+        fill_keep = 0.35 + 0.65 * fill_factor
+        score = collim_factor * flux_keep * fill_keep * contain_factor
+        w_s = float(cfg.fill_weight)
+        if w_s > 0:
+            score = score / (1.0 + 0.5 * w_s * size_error)
         score -= _geometry_penalty(p, cfg.penalty_scale)
         return score, fov_flux, uniformity, collection, aspect_error, footprint_aspect
 

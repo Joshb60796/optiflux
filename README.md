@@ -24,8 +24,9 @@ In PyCharm: right-click `app.py` → **Run**.
 - Single LED or COB grid (pitch, stagger, circular mask, tilt)
 
 ### Optics
-- Up to 8 elements; **per-element** lens type library (PCX, bi-convex, meniscus, …)
+- Up to 8 elements; **per-element** lens type library (PCX, bi-convex, meniscus, **ball / sphere**, …)
 - Spherical / conic / A4, biconic and cylindrical (anamorphic) modes
+- **Ball lenses** (full sphere, analytic intersection, sphere CAD) for collecting wide Lambertian emission and collimating toward the FOV
 - Materials: default **Formlabs Clear Resin**; also N-BK7, flints, fused silica, acrylic, other Formlabs resins (visible 380–780 nm)
 - Snell, Fresnel T, TIR absorb (default), positive edge-thickness clamping
 
@@ -48,7 +49,7 @@ In PyCharm: right-click `app.py` → **Run**.
 
 ### Optimizer (left-panel OPTIMIZER)
 - Derivative-free search (SciPy differential evolution + optional Nelder–Mead polish)
-- Goals: **rectangular FOV fill**, **sharpest focus** (crisp illumination border), **maximum evenness**
+- Goals: **rectangular FOV fill**, **sharpest focus** (crisp illumination border), **maximum evenness**, **collimated beam to FOV**
 - Extra lenses are **opt-in** (checkbox) and capped (0–8, stack limit 8)
 - **Focus group on target** — slide the stack to the source-image conjugate (flashlight focus)
 - **Two-phase rectangular mode** only when extras are allowed:
